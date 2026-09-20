@@ -1,0 +1,156 @@
+name: Adapt kernels
+
+# Adapt vendor packages into src/kernels/ and open a PR with the result.
+#
+# Trigger:
+#   - push to main that changes the package list (Boss added a new vendor package)
+#   - manual dispatch, optionally in strict mode (fail_on_error)
+#
+# The adaptation itself is one sequential job: every entry writes into the shared
+# registry src/kernels/offsets.h, so a matrix would create merge conflicts and
+# multiply the peak disk usage of full OTAs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/adapt/packages.json
+  workflow_dispatch:
+    inputs:
+      fail_on_error:
+        description: "Fail the run when any package cannot be adapted"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: adapt-kernels
+  cancel-in-progress: false
+
+jobs:
+  adapt:
+    runs-on: ubuntu-latest
+    env:
+      EXTRACT_BIN: tools/extract_rs/target/release/ghostlock-extract
+      PACKAGES: tools/adapt/packages.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Branch work (adapt/<run-id>) and PR creation need the full history.
+          fetch-depth: 0
+
+      - name: Check runner disk space
+        run: |
+          set -euo pipefail
+          df -h .
+          available_kb=$(df -Pk . | awk 'NR == 2 { print $4 }')
+          required_kb=$((6 * 1024 * 1024))
+          if [ "$available_kb" -lt "$required_kb" ]; then
+            echo "::error::less than 6 GB free on the runner disk (${available_kb} KiB available). Prefer boot.img + xbl_config.img (hundreds of MB) over a full GB-sized OTA, or use a larger runner."
+            exit 1
+          fi
+
+      - name: Ensure Rust >= 1.97.1
+        run: |
+          set -euo pipefail
+          rustc --version
+          required=1.97.1
+          current=$(rustc --version | awk '{ print $2 }')
+          if [ "$(printf '%s\n%s\n' "$required" "$current" | sort -V | head -n1)" != "$required" ]; then
+            echo "rustc $current is older than the crate's rust-version $required; updating stable"
+            rustup update stable
+            rustc --version
+          fi
+
+      - name: Build host extractor
+        run: |
+          set -euo pipefail
+          # Remote URLs need the optional `http` feature (Cargo.toml: default = [],
+          # http = ["payload-extract/http-rustls"]). Without it every http(s) entry in
+          # tools/adapt/packages.json fails with a payload-metadata error.
+          cargo build --release --features http --manifest-path tools/extract_rs/Cargo.toml
+
+      - name: Adapt packages
+        env:
+          # Dispatch may opt into strict mode; pushes default to soft failure so
+          # one expired vendor link cannot block the other packages.
+          FAIL_ON_ERROR: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_error || 'false' }}
+          SUMMARY_FILE: ${{ runner.temp }}/adapt-summary.md
+        run: bash tools/adapt/adapt.sh
+
+      - name: Append adaptation summary to the job summary
+        if: always()
+        run: |
+          if [ -f "${{ runner.temp }}/adapt-summary.md" ]; then
+            cat "${{ runner.temp }}/adapt-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Detect kernel registry changes
+        id: changes
+        run: |
+          set -euo pipefail
+          # A real adaptation always inserts an include into the shared registry.
+          # A header written without that insert means register_kernel() failed
+          # half-way (extractor exit 2, main.rs:484-486); never publish that state.
+          registry_changed=$(git status --porcelain -- src/kernels/offsets.h)
+          other_changes=$(git status --porcelain -- src/kernels | grep -F -v 'src/kernels/offsets.h' || true)
+          if [ -n "$registry_changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            # Only claim "nothing to adapt" when nothing at all changed; a partial
+            # write is reported by the block below instead.
+            if [ -z "$other_changes" ]; then
+              {
+                echo "## Kernel adaptation report"
+                echo
+                echo "No adaptation needed: the registry already contains or skips every package listed in tools/adapt/packages.json."
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          if [ -z "$registry_changed" ] && [ -n "$other_changes" ]; then
+            echo "::warning::src/kernels changed without a registry update - partial write, no PR opened. Review and clean up manually:"
+            printf '%s\n' "$other_changes"
+            {
+              echo
+              echo "### Partial writes detected"
+              echo
+              echo '`src/kernels` changed without `src/kernels/offsets.h`; no PR was opened. A header exists without its include entry - inspect the run log and remove it by hand if the entry is unusable.'
+              echo
+              echo '```'
+              printf '%s\n' "$other_changes"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          added=$(git status --porcelain -- src/kernels \
+            | awk '{ print $2 }' \
+            | sed -e 's#/offsets\.h$##' -e 's#/$##' \
+            | sed -n 's#^src/kernels/##p' \
+            | sort -u | paste -sd, -)
+          : "${added:=registry update}"
+
+          branch="adapt/${RUN_ID}"
+          git checkout -b "$branch"
+          git add src/kernels
+          git commit -m "adapt: register ${added}"
+          git push origin "$branch"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "Adapt kernels: ${added}" \
+            --body-file "${{ runner.temp }}/adapt-summary.md"
