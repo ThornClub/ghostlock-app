@@ -69,10 +69,10 @@ jobs:
     # (6 hours); 120 minutes covers slow links plus several sequential entries.
     timeout-minutes: 120
     env:
+      # Static paths only: the `runner` context is NOT available in a job-level
+      # env block (GitHub rejects the workflow), so paths that need it live on
+      # the steps that use them.
       EXTRACT_BIN: tools/extract_rs/target/release/ghostlock-extract
-      # Written by the plan step below (device list) or by the ad-hoc branch;
-      # adapt.sh only ever reads the generated file.
-      PACKAGES: ${{ runner.temp }}/pending.json
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -209,6 +209,9 @@ jobs:
           # soft failure so one expired vendor link cannot block the others.
           FAIL_ON_ERROR: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_error || 'false' }}
           SUMMARY_FILE: ${{ runner.temp }}/adapt-summary.md
+          # Written by the plan step (device list) or the ad-hoc branch;
+          # adapt.sh only ever reads the generated file.
+          PACKAGES: ${{ runner.temp }}/pending.json
           # `gh` does not read GITHUB_TOKEN from the environment on its own, and
           # a draft release asset is invisible without it - so gh:// delivery
           # fails on a runner unless the token is passed explicitly.
