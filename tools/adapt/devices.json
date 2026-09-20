@@ -1,0 +1,16 @@
+{
+  "comment": [
+    "适配流水线的唯一输入面 (由 tools/adapt/plan.py 读取并生成 pending.json; tools/adapt/adapt.sh 只消费 pending.json); 每次拿到新机型就新增 devices 条目, 提交到 main, 手动触发或等待每日轮询。",
+    "schema: vendors 是厂商预设 (同一家的地址形态通常一致, 只写一次), devices 是设备条目; 设备上的同名字段覆盖厂商预设, headers 是整体替换而不是逐键合并。",
+    "厂商预设字段: kind, xbl_config (布尔, 表示该厂商必须单独提供 xbl_config), tracked (布尔, 是否参与每日轮询), headers (固定请求头, 例如 {\"User-Agent\": \"...\"}); 未知字段会被拒绝, 拼错 tracked 不会静默失效。",
+    "设备字段: name (必填, 报告与账本里的设备名), vendor (必填, 指向厂商预设), address (必填, 固定地址: 始终指向最新包), kind, xbl_config (该设备的 xbl_config 地址/路径), tracked, release, notes, headers。",
+    "示例厂商预设 (仅示意, 不要照抄地址): \"xiaomi\": {\"kind\": \"ota\"}; \"oppo\": {\"kind\": \"boot\", \"xbl_config\": true}; \"honor\": {\"kind\": \"auto\", \"tracked\": true}。",
+    "address 与 kind 的关系: kind=ota|payload 时地址直传提取器 (全量 OTA zip / payload.bin 的 URL 或本地路径); kind=boot|image 时先下载再适配, 因此远程的 boot.img / 原始 Image / 套壳 zip 都能用; kind=auto (缺省) 按地址后缀推断 —— .zip/.bin 直传, .img/.image/.lz4/.gz (含 Image.gz) 先下载, 其它后缀探测 Content-Type 后再决定。",
+    "本地包投递: 把包上传成任意 release (含 draft) 的 asset, 再用 gh://<tag>/<asset> 作为 address —— runner 用自带 gh 下载, 不需要公开包。",
+    "容器自动拆包: 本地 zip / tar(.md5) 若内部没有 payload.bin, 会自动解包并取出其中的 boot*.img 再适配; 解不出则报告为 unsupported 并给出替代做法。专有容器 (.ozip / update.app) 不做解析, 只给指引。",
+    "tracked 轮询语义: 每日 03:00 UTC 探测 address 的 ETag / Content-Length / Last-Modified, 与账本 (Actions cache 里的 ledger.json, 不入仓) 一致时跳过, 不做任何下载; 因此固定地址需要支持 HEAD (或 Range 请求) 且至少给出这三个字段之一, 否则每轮都会重新适配。",
+    "release 与既有语义: 填了它且 src/kernels/<release>/offsets.h 已存在时该条目直接判为 already_registered; 所有可选字段必须是字符串, false / 0 / [] 这类非字符串值会被拒绝; 地址过期或适配失败默认不阻塞其它条目。"
+  ],
+  "vendors": {},
+  "devices": []
+}

@@ -3,8 +3,14 @@ name: Adapt kernels
 # Adapt vendor packages into src/kernels/ and open a PR with the result.
 #
 # Trigger:
-#   - push to main that changes the package list (Boss added a new vendor package)
-#   - manual dispatch, optionally in strict mode (fail_on_error)
+#   - push to main that changes the device list (Boss added a new device)
+#   - manual dispatch: either the checked-in device list, or one ad-hoc package
+#     given as inputs (name / image / xbl_config / kind / release)
+#   - daily schedule: poll every `tracked` device and adapt only what changed
+#
+# One implementation, three entry points: the ad-hoc branch and the poller both
+# produce a pending.json and hand it to tools/adapt/adapt.sh, so the
+# classification, the summary and the PR guard stay identical.
 #
 # The adaptation itself is one sequential job: every entry writes into the shared
 # registry src/kernels/offsets.h, so a matrix would create merge conflicts and
@@ -13,13 +19,40 @@ on:
   push:
     branches: [main]
     paths:
-      - tools/adapt/packages.json
+      - tools/adapt/devices.json
   workflow_dispatch:
     inputs:
+      name:
+        description: "Ad-hoc package: report label (default: basename of image)"
+        type: string
+        required: false
+      image:
+        description: "Ad-hoc package: OTA/payload URL, boot.img/Image URL, local path or gh://<tag>/<asset>"
+        type: string
+        required: false
+      xbl_config:
+        description: "Ad-hoc package: optional xbl_config URL / path / gh:// reference"
+        type: string
+        required: false
+      kind:
+        description: "Ad-hoc package: how to read the image (auto infers from the suffix)"
+        type: choice
+        options: [auto, ota, payload, boot, image]
+        default: auto
+        required: false
+      release:
+        description: "Ad-hoc package: announced uname -r, skips the download when already registered"
+        type: string
+        required: false
       fail_on_error:
         description: "Fail the run when any package cannot be adapted"
         type: boolean
         default: false
+  schedule:
+    # Daily poll at 03:00 UTC (morning in CN). GitHub pauses scheduled
+    # workflows after 60 days without repository activity; re-enable with a
+    # manual dispatch, or from the Actions tab.
+    - cron: '0 3 * * *'
 
 permissions:
   contents: write
@@ -37,7 +70,9 @@ jobs:
     timeout-minutes: 120
     env:
       EXTRACT_BIN: tools/extract_rs/target/release/ghostlock-extract
-      PACKAGES: tools/adapt/packages.json
+      # Written by the plan step below (device list) or by the ad-hoc branch;
+      # adapt.sh only ever reads the generated file.
+      PACKAGES: ${{ runner.temp }}/pending.json
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -45,7 +80,80 @@ jobs:
           # Branch work (adapt/<run-id>) and PR creation need the full history.
           fetch-depth: 0
 
+      - name: Restore adaptation ledger
+        uses: actions/cache/restore@v6
+        with:
+          # Per-device fingerprints of the last poll. The ledger is never
+          # committed: a bot commit would trigger the upstream build.yml full
+          # build. A cache miss just means "everything is unknown": one extra
+          # probe and, for an unchanged package, one extra adaptation.
+          # Cache entries are immutable, so the refreshed ledger is saved under
+          # a hash-suffixed key (see the save step below) and this prefix
+          # restore-key finds the newest one.
+          path: ${{ runner.temp }}/ledger.json
+          key: adapt-ledger-v1
+          restore-keys: |
+            adapt-ledger-v1-
+
+      - name: Plan adaptation targets
+        id: plan
+        env:
+          LEDGER: ${{ runner.temp }}/ledger.json
+          PENDING_OUT: ${{ runner.temp }}/pending.json
+          PLAN_SUMMARY: ${{ runner.temp }}/plan-summary.md
+          ADHOC_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.name || '' }}
+          ADHOC_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.image || '' }}
+          ADHOC_XBL: ${{ github.event_name == 'workflow_dispatch' && inputs.xbl_config || '' }}
+          ADHOC_KIND: ${{ github.event_name == 'workflow_dispatch' && inputs.kind || '' }}
+          ADHOC_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.release || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ADHOC_IMAGE" ]; then
+            # Ad-hoc dispatch: bypass the device list and the poller, but keep
+            # the same pending.json shape so adapt.sh stays the only executor.
+            python3 - <<'PY'
+          import json
+          import os
+
+          image = os.environ["ADHOC_IMAGE"]
+          name = os.environ.get("ADHOC_NAME", "").strip() or image.rsplit("/", 1)[-1].split("?", 1)[0] or "ad-hoc"
+          entry = {
+              "name": name,
+              "image": image,
+              "xbl_config": os.environ.get("ADHOC_XBL", ""),
+              "notes": "ad-hoc dispatch",
+              "release": os.environ.get("ADHOC_RELEASE", ""),
+              "kind": os.environ.get("ADHOC_KIND", ""),
+          }
+          with open(os.environ["PENDING_OUT"], "w", encoding="utf-8") as handle:
+              json.dump({"packages": [entry]}, handle, indent=2, ensure_ascii=False)
+              handle.write("\n")
+          with open(os.environ["PLAN_SUMMARY"], "w", encoding="utf-8") as handle:
+              handle.write("## Device adaptation plan\n\n")
+              handle.write("Ad-hoc dispatch: the device list and the poller are bypassed; the package below is adapted directly.\n\n")
+              handle.write("| Package | Kind | Image |\n|---|---|---|\n")
+              handle.write(f"| {name} | {entry['kind'] or 'auto'} | `{image}` |\n")
+          PY
+          else
+            python3 tools/adapt/plan.py \
+              --config tools/adapt/devices.json \
+              --ledger "$LEDGER" \
+              --pending-out "$PENDING_OUT" \
+              --summary-out "$PLAN_SUMMARY"
+          fi
+          cat "$PLAN_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+          count=$(python3 -c 'import json, os; print(len(json.load(open(os.environ["PENDING_OUT"], encoding="utf-8"))["packages"]))')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "has_pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_pending=false" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing to adapt: every tracked device is already up-to-date." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Check runner disk space
+        if: steps.plan.outputs.has_pending == 'true'
         run: |
           set -euo pipefail
           df -h .
@@ -57,6 +165,7 @@ jobs:
           fi
 
       - name: Ensure Rust >= 1.97.1
+        if: steps.plan.outputs.has_pending == 'true'
         run: |
           set -euo pipefail
           rustc --version
@@ -69,6 +178,7 @@ jobs:
           fi
 
       - name: Cache cargo registry and build output
+        if: steps.plan.outputs.has_pending == 'true'
         uses: actions/cache@v6
         with:
           # The extractor has a git dependency and 9 crates; a cold build costs
@@ -84,20 +194,76 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build host extractor
+        if: steps.plan.outputs.has_pending == 'true'
         run: |
           set -euo pipefail
           # Remote URLs need the optional `http` feature (Cargo.toml: default = [],
           # http = ["payload-extract/http-rustls"]). Without it every http(s) entry in
-          # tools/adapt/packages.json fails with a payload-metadata error.
+          # the package list fails with a payload-metadata error.
           cargo build --release --features http --manifest-path tools/extract_rs/Cargo.toml
 
       - name: Adapt packages
+        if: steps.plan.outputs.has_pending == 'true'
         env:
-          # Dispatch may opt into strict mode; pushes default to soft failure so
-          # one expired vendor link cannot block the other packages.
+          # Dispatch may opt into strict mode; pushes and the poller default to
+          # soft failure so one expired vendor link cannot block the others.
           FAIL_ON_ERROR: ${{ github.event_name == 'workflow_dispatch' && inputs.fail_on_error || 'false' }}
           SUMMARY_FILE: ${{ runner.temp }}/adapt-summary.md
-        run: bash tools/adapt/adapt.sh
+          # `gh` does not read GITHUB_TOKEN from the environment on its own, and
+          # a draft release asset is invisible without it - so gh:// delivery
+          # fails on a runner unless the token is passed explicitly.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # tee keeps the run log readable while the RESULT / RELEASE lines are
+          # captured for the ledger update below; pipefail propagates adapt.sh's
+          # exit code (FAIL_ON_ERROR).
+          bash tools/adapt/adapt.sh | tee "$RUNNER_TEMP/adapt-results.txt"
+
+      - name: Record adaptation results in the ledger
+        if: always() && steps.plan.outputs.has_pending == 'true'
+        env:
+          LEDGER: ${{ runner.temp }}/ledger.json
+          RESULTS: ${{ runner.temp }}/adapt-results.txt
+        run: |
+          set -euo pipefail
+          if [ ! -f "$RESULTS" ]; then
+            echo "adapt.sh produced no RESULT lines; the ledger is left unchanged"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          statuses = {}
+          releases = {}
+          with open(os.environ["RESULTS"], encoding="utf-8") as handle:
+              for line in handle:
+                  # Device names may contain spaces, so parse from the right:
+                  # RESULT <name...> <status> <exit-code> <duration>
+                  # RELEASE <name...> <release>
+                  parts = line.split()
+                  if len(parts) >= 5 and parts[0] == "RESULT":
+                      statuses[" ".join(parts[1:-3])] = parts[-3]
+                  elif len(parts) >= 3 and parts[0] == "RELEASE":
+                      releases[" ".join(parts[1:-1])] = parts[-1]
+
+          for name, status in statuses.items():
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "tools/adapt/plan.py",
+                      "--record",
+                      "--ledger", os.environ["LEDGER"],
+                      "--name", name,
+                      "--status", status,
+                      "--release", releases.get(name, ""),
+                  ],
+                  check=True,
+              )
+          print(f"recorded {len(statuses)} adaptation result(s) in the ledger")
+          PY
 
       - name: Append adaptation summary to the job summary
         if: always()
@@ -108,6 +274,7 @@ jobs:
 
       - name: Detect kernel registry changes
         id: changes
+        if: steps.plan.outputs.has_pending == 'true'
         run: |
           set -euo pipefail
           # A real adaptation always inserts an include into the shared registry.
@@ -125,7 +292,7 @@ jobs:
               {
                 echo "## Kernel adaptation report"
                 echo
-                echo "No adaptation needed: the registry already contains or skips every package listed in tools/adapt/packages.json."
+                echo "No adaptation needed: the registry already contains or skips every pending package."
               } >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
@@ -167,8 +334,46 @@ jobs:
           git commit -m "adapt: register ${added}"
           git push origin "$branch"
 
+          # The plan table (which devices were up-to-date and which were queued)
+          # gives the reviewer the polling context around this adaptation.
+          {
+            if [ -f "${{ runner.temp }}/plan-summary.md" ]; then
+              cat "${{ runner.temp }}/plan-summary.md"
+              echo
+            fi
+            cat "${{ runner.temp }}/adapt-summary.md"
+          } > "${{ runner.temp }}/pr-body.md"
+
           gh pr create \
             --base main \
             --head "$branch" \
             --title "Adapt kernels: ${added}" \
-            --body-file "${{ runner.temp }}/adapt-summary.md"
+            --body-file "${{ runner.temp }}/pr-body.md"
+
+      - name: Hash the refreshed ledger
+        id: ledger-hash
+        if: always()
+        env:
+          LEDGER: ${{ runner.temp }}/ledger.json
+        run: |
+          set -euo pipefail
+          if [ -f "$LEDGER" ]; then
+            # hashFiles() only reads files inside GITHUB_WORKSPACE and the
+            # ledger lives in RUNNER_TEMP, so the content hash that names the
+            # cache entry is computed here instead.
+            echo "key=adapt-ledger-v1-$(sha256sum "$LEDGER" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save adaptation ledger
+        if: always() && steps.ledger-hash.outputs.key != ''
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          # Cache entries are immutable: reusing the fixed key would freeze the
+          # ledger after the first run. The content hash in the key makes every
+          # refreshed ledger a new entry and the restore step's prefix key finds
+          # the newest one. A duplicate key (nothing changed) is harmless.
+          path: ${{ runner.temp }}/ledger.json
+          key: ${{ steps.ledger-hash.outputs.key }}
