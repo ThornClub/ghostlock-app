@@ -20,6 +20,13 @@ on:
     branches: [main]
     paths:
       - tools/adapt/devices.json
+      # The pipeline validates itself: without these, a broken workflow or
+      # script could not be exercised until the next scheduled poll. With an
+      # empty device list the plan step finds nothing pending and every
+      # expensive step is skipped, so this costs seconds.
+      - tools/adapt/adapt.sh
+      - tools/adapt/plan.py
+      - .github/workflows/adapt.yml
   workflow_dispatch:
     inputs:
       name:
