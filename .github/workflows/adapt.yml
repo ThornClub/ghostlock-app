@@ -32,12 +32,15 @@ concurrency:
 jobs:
   adapt:
     runs-on: ubuntu-latest
+    # A stalled GB-sized OTA download must not burn the platform maximum
+    # (6 hours); 120 minutes covers slow links plus several sequential entries.
+    timeout-minutes: 120
     env:
       EXTRACT_BIN: tools/extract_rs/target/release/ghostlock-extract
       PACKAGES: tools/adapt/packages.json
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Branch work (adapt/<run-id>) and PR creation need the full history.
           fetch-depth: 0
@@ -64,6 +67,21 @@ jobs:
             rustup update stable
             rustc --version
           fi
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          # The extractor has a git dependency and 9 crates; a cold build costs
+          # minutes on every run, so reuse the registry and target dir. The key
+          # follows the locked dependency graph; a changed Cargo.lock still
+          # restores the prefix and only recompiles.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/extract_rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tools/extract_rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build host extractor
         run: |
