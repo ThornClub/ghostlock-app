@@ -374,6 +374,23 @@ probe_content_type() {
   return 0
 }
 
+# Final URL behind a redirect chain, without downloading the payload: a
+# 1-byte ranged GET is enough and works for CDNs that refuse HEAD. Share
+# gateways (fusionupdater-style links) answer with a 302 to a short-lived
+# signed CDN URL, and asking the extractor to range-read through the gateway
+# means hundreds of those redirects, which the gateway rate-limits (HTTP 429).
+# Resolving once here keeps every range request on the CDN. Prints the input
+# unchanged when resolution fails, so a direct URL still behaves as before.
+resolve_redirects() {
+  local url="$1" final
+  final="$("$CURL_BIN" -sSL -r 0-0 --max-time 30 -o /dev/null -w '%{url_effective}' "$url" 2>/dev/null || true)"
+  if [ -n "$final" ]; then
+    printf '%s' "$final"
+  else
+    printf '%s' "$url"
+  fi
+}
+
 # Resolve one declared value into $resolved. $1 role, $2 value, $3 effective kind.
 resolve_input() {
   local role="$1" value="$2" kind="$3"
@@ -447,8 +464,10 @@ resolve_input() {
           ;;
         image:ota | image:payload)
           # A full OTA / payload: the extractor range-reads it, so never pull it
-          # down here.
-          resolved="$value"
+          # down here. Redirects are resolved once (see resolve_redirects) so
+          # every range request hits the final CDN instead of a rate-limited
+          # share gateway.
+          resolved="$(resolve_redirects "$value")"
           ;;
         *)
           # kind=auto (or explicitly auto): infer from the URL path.
@@ -456,7 +475,9 @@ resolve_input() {
           path_only="${value%%\?*}"
           case "$path_only" in
             *.zip | *.bin)
-              resolved="$value"
+              # Same reason as kind=ota: a share gateway that redirects to a
+              # signed CDN URL must not be hit once per range request.
+              resolved="$(resolve_redirects "$value")"
               ;;
             *.img | *.image | *.lz4 | *.gz)
               # Covers boot.img, raw Image, Image.gz and LZ4 images alike.
