@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Adapt one batch of vendor packages into src/kernels/.
+# Adapt one batch of vendor packages into app/src/main/assets/kernel_profiles/.
 #
 # The package list is JSON with a top-level "packages" array; every entry has
 # six string fields joined into 0x1F records below:
@@ -12,10 +12,10 @@
 #
 # For every entry it normalizes the declared input (gh:// release asset fetch,
 # remote boot.img download, container unpacking - see "input normalization"),
-# runs the host offset extractor with --register, records the outcome, and
-# appends a Markdown report to $SUMMARY_FILE. Entries are processed one at a
-# time because src/kernels/offsets.h is a shared file and parallel writers
-# would race on it.
+# runs the host offset extractor with --format conf, registers the produced
+# profile in kernel_profiles/index.conf, records the outcome, and appends a
+# Markdown report to $SUMMARY_FILE. Entries are processed one at a time because
+# index.conf is a shared file and parallel writers would race on it.
 #
 # Exit status:
 #   0  normal run (failed packages are reported, see FAIL_ON_ERROR)
@@ -42,10 +42,15 @@ GH_BIN="${GH_BIN:-gh}"
 # GITHUB_REPOSITORY; the fallback keeps local runs working.
 GH_REPO="${GITHUB_REPOSITORY:-ThornClub/ghostlock-app}"
 # Root used by the checks adapt.sh performs itself: the `release` early-skip
-# existence check and the README coverage scan. The extractor still writes
-# relative to the process cwd, so in CI this stays "." while the stub tests can
-# point it at a temporary tree.
+# existence check and the README coverage scan. The extractor writes to an
+# explicit --out path, so in CI this stays "." while the stub tests can point
+# it at a temporary tree.
 REPO_ROOT="${REPO_ROOT:-.}"
+# Bundled profile registry. The extractor no longer knows the repository
+# layout: it writes a self-contained HOCON profile to --out, and this script
+# owns both the file placement and the index.conf registration.
+PROFILE_DIR="$REPO_ROOT/app/src/main/assets/kernel_profiles"
+PROFILE_INDEX="$PROFILE_DIR/index.conf"
 
 if [ -z "$PACKAGES" ] || [ ! -f "$PACKAGES" ]; then
   echo "adapt: ERROR: package list not found: ${PACKAGES:-<PACKAGES unset>}" >&2
@@ -220,6 +225,92 @@ safe_basename() {
   base="${base//[^A-Za-z0-9._-]/_}"
   [ -n "$base" ] || base="input"
   printf '%s' "$base"
+}
+
+# Release key carried by a generated profile. The extractor renders
+# `release = "<uname -r>"` as a top-level line; anchoring on line start keeps
+# the leading comment block and any nested keys out of the match.
+profile_release() {
+  sed -n 's/^release = "\(.*\)"$/\1/p' "$1" | head -n1
+}
+
+# Publish one generated profile: place it under its release name and register
+# it in index.conf. The extractor only writes a self-contained HOCON file, so
+# both steps belong here. Sets release / register_status ("added" or
+# "already_registered") / register_error.
+#
+# index.conf holds a single `profiles = [ ... ]` array closed by the only line
+# that is exactly `]`, entries have no trailing comma (HOCON allows omitting
+# it), so inserting one equally formatted line before that bracket keeps the
+# file valid without parsing HOCON here.
+register_profile() {
+  local tmp="$1" target entry file_existed=0
+  release=""
+  register_status=""
+  register_error=""
+
+  release=$(profile_release "$tmp")
+  if [ -z "$release" ]; then
+    register_error="the generated profile carries no release line"
+    return 1
+  fi
+
+  target="$PROFILE_DIR/$release.conf"
+  if [ -e "$target" ]; then
+    # Re-run: the profile is already published. The index entry is still
+    # checked below, so a profile left behind by a failed registration (or by a
+    # hand-written file) heals instead of staying invisible to the app.
+    file_existed=1
+    rm -f "$tmp"
+  else
+    if ! mkdir -p "$PROFILE_DIR"; then
+      register_error="cannot create $PROFILE_DIR"
+      return 1
+    fi
+    if ! mv "$tmp" "$target"; then
+      register_error="cannot move the generated profile to $target"
+      return 1
+    fi
+  fi
+
+  if grep -qF "release = \"$release\"" "$PROFILE_INDEX" 2>/dev/null; then
+    if [ "$file_existed" -eq 1 ]; then
+      register_status="already_registered"
+    else
+      register_status="added"
+    fi
+    return 0
+  fi
+
+  # Registration is the last step, so every failure from here rolls the profile
+  # back: a file without an index entry is invisible to the app, and leaving it
+  # behind would let a later entry's successful run carry it into the PR.
+  entry="  { release = \"$release\", file = \"$release.conf\" }"
+  # The `cr` branch keeps the inserted line consistent with its neighbours when
+  # awk preserves CR (a CRLF working copy). MSYS awk strips CR on input, so such
+  # a checkout is rewritten with LF here; git's `* text=auto` normalization keeps
+  # the committed diff to the single added line either way.
+  if ! awk -v entry="$entry" -v cr="$(printf '\r')" '
+    { if (!inserted && ($0 == "]" || $0 == "]" cr)) {
+        print entry ($0 == "]" cr ? cr : "")
+        inserted = 1
+      }
+      print }
+    END { exit inserted ? 0 : 3 }
+  ' "$PROFILE_INDEX" > "$PROFILE_INDEX.tmp"; then
+    rm -f "$PROFILE_INDEX.tmp"
+    [ "$file_existed" -eq 1 ] || rm -f "$target"
+    register_error="cannot insert $release into $PROFILE_INDEX (no top-level ] array close)"
+    return 1
+  fi
+  if ! mv "$PROFILE_INDEX.tmp" "$PROFILE_INDEX"; then
+    rm -f "$PROFILE_INDEX.tmp"
+    [ "$file_existed" -eq 1 ] || rm -f "$target"
+    register_error="cannot replace $PROFILE_INDEX"
+    return 1
+  fi
+  register_status="added"
+  return 0
 }
 
 # Turn the per-entry header blob ("name\x1dvalue" pairs joined by \x1e) into
@@ -552,7 +643,11 @@ for index in "${!names[@]}"; do
   # Early skip: a maintained `release` field turns the entry into a pure
   # existence check in the registry, so a repeated GB-sized download and the
   # extractor run are avoided entirely. No scratch dir, no extractor call.
-  if [ -n "$release_field" ] && [ -f "$REPO_ROOT/src/kernels/$release_field/offsets.h" ]; then
+  # The index entry is checked too: a profile left behind by an interrupted
+  # registration would otherwise short-circuit every later run and never become
+  # visible to the app.
+  if [ -n "$release_field" ] && [ -f "$PROFILE_DIR/$release_field.conf" ] &&
+    grep -qF "release = \"$release_field\"" "$PROFILE_INDEX" 2>/dev/null; then
     echo "adapt: skipping '$name': $release_field is already registered (release field)"
     rows+=("| $label | already_registered (skipped by release field) | 0 | 0 |")
     readme_rows+=("| \`$release_field\` | $name |")
@@ -605,56 +700,45 @@ for index in "${!names[@]}"; do
   # --work-dir keeps the extractor's payload scratch data inside the directory
   # that is wiped before the next entry; without it the extractor writes
   # ghostlock-payload-<pid>/ under the runner's system temp dir and those
-  # directories accumulate for the whole run.
+  # directories accumulate for the whole run. --format conf makes the extractor
+  # emit a self-contained profile instead of a C header: registration moved
+  # here because the extractor no longer knows the repository layout.
+  tmp_conf="$WORKDIR/$(safe_basename "$prepared_image").profile.conf"
+  rm -f "$tmp_conf"
   if [ -n "$prepared_xbl" ]; then
-    "$EXTRACT_BIN" "$prepared_image" --xbl-config "$prepared_xbl" --work-dir "$WORKDIR" --register 2>"$stderr_file"
+    "$EXTRACT_BIN" "$prepared_image" --xbl-config "$prepared_xbl" --work-dir "$WORKDIR" \
+      --format conf --out "$tmp_conf" 2>"$stderr_file"
   else
-    "$EXTRACT_BIN" "$prepared_image" --work-dir "$WORKDIR" --register 2>"$stderr_file"
+    "$EXTRACT_BIN" "$prepared_image" --work-dir "$WORKDIR" \
+      --format conf --out "$tmp_conf" 2>"$stderr_file"
   fi
   code=$?
   duration=$(( $(date +%s) - started ))
   cat "$stderr_file"
 
-  # Classification (evidence: tools/extract_rs/src/main.rs:456-486 and the
-  # exit-code mapping at main.rs:541-552).
-  #   0 + "wrote "             -> added (header written, include inserted)
-  #   0 + "already registered" -> already_registered (no duplicate table)
-  #   0 otherwise              -> ok_unknown (needs a manual look)
-  #   6                        -> already_fixed (conclusive, not a failure)
-  #   2/3/4/5 or anything else -> failed
-  # "wrote " is checked first: a run that rewrites a header can still print
-  # "warning: ... is already registered with ..." (report.rs:368), while an
-  # early "already registered" return never prints "wrote ".
+  # Classification. The extractor only reports whether the image could be
+  # analysed (exit 0) or that the kernel is already fixed (exit 6); whether the
+  # profile is new is decided by register_profile above.
+  #   0 + register_status=added     -> added (a profile file or its index entry
+  #                                   is new; both end up present)
+  #   0 + already_registered       -> already_registered (file and index entry
+  #                                   both already existed)
+  #   0 otherwise                  -> failed (the profile could not be published)
+  #   6                            -> already_fixed (conclusive, not a failure)
+  #   2/3/4/5 or anything else     -> failed
+  release=""
+  register_error=""
   if [ "$code" -eq 0 ]; then
-    if grep -q "wrote " "$stderr_file"; then
-      status="added"
-    elif grep -q "already registered" "$stderr_file"; then
-      status="already_registered"
+    if register_profile "$tmp_conf"; then
+      status="$register_status"
     else
-      status="ok_unknown"
+      status="failed"
     fi
   elif [ "$code" -eq 6 ]; then
     status="already_fixed"
   else
     status="failed"
   fi
-
-  # Recover the registered release key for the README hints.
-  release=""
-  case "$status" in
-    added)
-      wrote_line=$(grep -m1 "^wrote " "$stderr_file" || true)
-      if [ -n "$wrote_line" ]; then
-        release="${wrote_line#wrote }"
-        release="${release%/offsets.h}"
-        release="${release##*/}"
-      fi
-      ;;
-    already_registered)
-      release=$(sed -n "s/^info: \(.*\) already registered.*/\1/p" "$stderr_file" | head -n1)
-      ;;
-  esac
-
   # A declared release field that disagrees with the extracted value is surfaced
   # here but never overrides the extractor: the payload metadata is authoritative,
   # the field only exists to skip a repeated download.
@@ -666,11 +750,13 @@ for index in "${!names[@]}"; do
 
   if [ "$status" = "failed" ]; then
     failed_count=$((failed_count + 1))
-    attention+=("- \`$name\`: failed (exit $code: $(describe_exit "$code"))")
+    if [ -n "${register_error:-}" ]; then
+      attention+=("- \`$name\`: profile not published: $register_error")
+    else
+      attention+=("- \`$name\`: failed (exit $code: $(describe_exit "$code"))")
+    fi
   elif [ "$status" = "already_fixed" ]; then
     attention+=("- \`$name\`: already fixed (exit 6: $(describe_exit 6)) - conclusive, not a failure")
-  elif [ "$status" = "ok_unknown" ]; then
-    attention+=("- \`$name\`: exit 0 without a recognized message; inspect the job log")
   fi
 
   warnings_text=$(grep "^warning:" "$stderr_file" || true)
@@ -697,23 +783,28 @@ for index in "${!names[@]}"; do
   fi
 done
 
-# README coverage: every registered kernel should have a row in both device
-# tables, but --register never touches them and new kernels only land in
-# src/kernels/. Purely informational - a missing documentation row must not
-# block an otherwise successful adaptation.
+# Documentation coverage: every release listed in kernel_profiles/index.conf
+# should have a row in both supported-device tables. index.conf is the authority
+# here because the directory also holds templates and shared includes
+# (execution-*.conf, credential-6x.conf, ...), which are not devices. Purely
+# informational - a missing documentation row must not block an otherwise
+# successful adaptation.
 kernel_releases=()
-for kernel_dir in "$REPO_ROOT"/src/kernels/*/; do
-  [ -d "$kernel_dir" ] || continue
-  kernel_dir="${kernel_dir%/}"
-  kernel_releases+=("${kernel_dir##*/}")
-done
+if [ -f "$PROFILE_INDEX" ]; then
+  while IFS= read -r kernel; do
+    [ -n "$kernel" ] || continue
+    # Reference templates live in the same index but document no device.
+    case "$kernel" in *-template) continue ;; esac
+    kernel_releases+=("$kernel")
+  done < <(sed -n 's/^  *{ *release *= *"\([^"]*\)".*/\1/p' "$PROFILE_INDEX")
+fi
 total_kernels=${#kernel_releases[@]}
 
 missing_in_readme=()
 missing_in_readme_zh=()
 for kernel in "${kernel_releases[@]}"; do
-  grep -qF -- "$kernel" "$REPO_ROOT/README.md" 2>/dev/null || missing_in_readme+=("$kernel")
-  grep -qF -- "$kernel" "$REPO_ROOT/README_ZH.md" 2>/dev/null || missing_in_readme_zh+=("$kernel")
+  grep -qF -- "$kernel" "$REPO_ROOT/docs/kernel_profiles/SUPPORTED_DEVICES.md" 2>/dev/null || missing_in_readme+=("$kernel")
+  grep -qF -- "$kernel" "$REPO_ROOT/docs/kernel_profiles/SUPPORTED_DEVICES_ZH.md" 2>/dev/null || missing_in_readme_zh+=("$kernel")
 done
 
 {
@@ -728,11 +819,10 @@ done
     echo
     echo "Status legend:"
     echo
-    echo "- \`added\` - new kernel registered (exit 0, header written)."
-    echo "- \`already_registered\` - release already present, nothing written (exit 0)."
+    echo "- \`added\` - new profile written and registered in kernel_profiles/index.conf (exit 0)."
+    echo "- \`already_registered\` - the profile file already exists, nothing written (exit 0)."
     echo "- \`already_fixed\` - exit 6, the kernel already contains the fix; conclusive, not a failure."
-    echo "- \`failed\` - exit 2 (generic parse failure), 3 (pselect route infeasible), 4 (missing required offsets) or 5 (kallsyms recovery failed)."
-    echo "- \`ok_unknown\` - exit 0 without a recognized message; inspect the job log."
+    echo "- \`failed\` - exit 2 (generic parse failure), 3 (pselect route infeasible), 4 (missing required offsets) or 5 (kallsyms recovery failed); a profile that could not be published is reported with the reason here too."
     echo "- \`unsupported\` - the declared input is a container this pipeline cannot use (proprietary vendor container, or an archive with no \`boot.img\` / \`payload.bin\`); see Needs attention for the alternative."
     echo "- An exit code of \`-\` means the extractor never ran because the input could not be prepared (fetch or unpack failure); \`failed\` and \`unsupported\` both count towards \`FAIL_ON_ERROR\`."
     echo
@@ -755,35 +845,35 @@ done
     printf "%s\n" "${warning_lines[@]}"
   fi
   echo
-  echo "### README device tables"
+  echo "### Device table rows"
   echo
   if [ "${#readme_rows[@]}" -eq 0 ]; then
     echo "No usable rows; nothing to paste."
   else
-    echo "Add these rows to README.md and README_ZH.md by hand (\`--register\` does not update them):"
+    echo "Add these rows to docs/kernel_profiles/SUPPORTED_DEVICES.md and SUPPORTED_DEVICES_ZH.md by hand (registering the profile does not update them):"
     echo
     echo "| Kernel (uname -r) | Device |"
     echo "|---|---|"
     printf "%s\n" "${readme_rows[@]}"
   fi
   echo
-  echo "### README coverage"
+  echo "### Device table coverage"
   echo
   if [ "$total_kernels" -eq 0 ]; then
-    echo "No kernel directories under \`$REPO_ROOT/src/kernels\`; nothing to check."
+    echo "No releases found in \`$PROFILE_INDEX\`; nothing to check."
   elif [ "${#missing_in_readme[@]}" -eq 0 ] && [ "${#missing_in_readme_zh[@]}" -eq 0 ]; then
-    echo "all $total_kernels kernels are listed in README.md and README_ZH.md"
+    echo "all $total_kernels releases are listed in docs/kernel_profiles/SUPPORTED_DEVICES.md and SUPPORTED_DEVICES_ZH.md"
   else
     echo "Registered kernels: $total_kernels."
     echo
     if [ "${#missing_in_readme[@]}" -gt 0 ]; then
-      echo "**README.md** is missing ${#missing_in_readme[@]} release(s):"
+      echo "**SUPPORTED_DEVICES.md** is missing ${#missing_in_readme[@]} release(s):"
       echo
       printf -- "- \`%s\`\n" "${missing_in_readme[@]}"
       echo
     fi
     if [ "${#missing_in_readme_zh[@]}" -gt 0 ]; then
-      echo "**README_ZH.md** is missing ${#missing_in_readme_zh[@]} release(s):"
+      echo "**SUPPORTED_DEVICES_ZH.md** is missing ${#missing_in_readme_zh[@]} release(s):"
       echo
       printf -- "- \`%s\`\n" "${missing_in_readme_zh[@]}"
       echo

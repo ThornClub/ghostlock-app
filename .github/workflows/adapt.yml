@@ -1,6 +1,6 @@
 name: Adapt kernels
 
-# Adapt vendor packages into src/kernels/ and open a PR with the result.
+# Adapt vendor packages into app/src/main/assets/kernel_profiles/ and open a PR
 #
 # Trigger:
 #   - push to main that changes the device list (Boss added a new device)
@@ -13,7 +13,7 @@ name: Adapt kernels
 # classification, the summary and the PR guard stay identical.
 #
 # The adaptation itself is one sequential job: every entry writes into the shared
-# registry src/kernels/offsets.h, so a matrix would create merge conflicts and
+# registry kernel_profiles/index.conf, so a matrix would create merge conflicts and
 # multiply the peak disk usage of full OTAs.
 on:
   push:
@@ -287,11 +287,12 @@ jobs:
         if: steps.plan.outputs.has_pending == 'true'
         run: |
           set -euo pipefail
-          # A real adaptation always inserts an include into the shared registry.
-          # A header written without that insert means register_kernel() failed
-          # half-way (extractor exit 2, main.rs:484-486); never publish that state.
-          registry_changed=$(git status --porcelain -- src/kernels/offsets.h)
-          other_changes=$(git status --porcelain -- src/kernels | grep -F -v 'src/kernels/offsets.h' || true)
+          # A real adaptation always writes the profile file AND registers it in
+          # index.conf. index.conf alone means the registration landed without
+          # its profile (the app would fail to load it); a profile alone means
+          # register_profile() failed half-way. Never publish either state.
+          registry_changed=$(git status --porcelain -- app/src/main/assets/kernel_profiles/index.conf)
+          other_changes=$(git status --porcelain -- app/src/main/assets/kernel_profiles | grep -F -v 'kernel_profiles/index.conf' || true)
           if [ -n "$registry_changed" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -302,18 +303,18 @@ jobs:
               {
                 echo "## Kernel adaptation report"
                 echo
-                echo "No adaptation needed: the registry already contains or skips every pending package."
+                echo "No adaptation needed: index.conf already registers or skips every pending package."
               } >> "$GITHUB_STEP_SUMMARY"
             fi
           fi
           if [ -z "$registry_changed" ] && [ -n "$other_changes" ]; then
-            echo "::warning::src/kernels changed without a registry update - partial write, no PR opened. Review and clean up manually:"
+            echo "::warning::kernel_profiles changed without an index.conf update - partial write, no PR opened. Review and clean up manually:"
             printf '%s\n' "$other_changes"
             {
               echo
               echo "### Partial writes detected"
               echo
-              echo '`src/kernels` changed without `src/kernels/offsets.h`; no PR was opened. A header exists without its include entry - inspect the run log and remove it by hand if the entry is unusable.'
+              echo '`app/src/main/assets/kernel_profiles` changed without `index.conf`; no PR was opened. A profile exists without its index entry - inspect the run log and remove it by hand if it is unusable.'
               echo
               echo '```'
               printf '%s\n' "$other_changes"
@@ -331,16 +332,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          added=$(git status --porcelain -- src/kernels \
-            | awk '{ print $2 }' \
-            | sed -e 's#/offsets\.h$##' -e 's#/$##' \
-            | sed -n 's#^src/kernels/##p' \
+          # The release key comes from the index.conf diff: register_profile
+          # always touches index.conf, so one added `release = "..."` line per
+          # adapted kernel is the authoritative list for the commit message and
+          # PR title.
+          added=$(git diff --unified=0 -- app/src/main/assets/kernel_profiles/index.conf \
+            | sed -n 's/^+.*release *= *"\([^"]*\)".*/\1/p' \
             | sort -u | paste -sd, -)
-          : "${added:=registry update}"
+          : "${added:=kernel profiles}"
 
           branch="adapt/${RUN_ID}"
           git checkout -b "$branch"
-          git add src/kernels
+          git add app/src/main/assets/kernel_profiles
           git commit -m "adapt: register ${added}"
           git push origin "$branch"
 
