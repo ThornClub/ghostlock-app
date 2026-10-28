@@ -56,6 +56,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
 
+        /* 64560 编排参数 (design D3): 缺省即真机验证过的那套, 可在 ghostlock_prefs 里覆盖。 */
+        const val PrefPayloadRounds = "payload_rounds"
+        const val PrefPayloadGate = "payload_gate_mc"
+        const val PrefPayloadPanic = "payload_panic_mc"
+        const val PrefPayloadQuiet = "payload_quiet_seconds"
+        const val PrefPayloadReboot = "payload_reboot_each_round"
+
         /* 64560 载荷编排 (design D1/D4): 轮内日志尾部、UserService 退出码与几个等待上限。 */
         const val RoundTailLines = 40
         const val PayloadExitStalled = 3
@@ -483,7 +490,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         writeSidecar: (String, ByteArray) -> Boolean,
         archivedLog: (String) -> Unit,
     ): Int {
-        val plan = payloadPlan()
+        val plan = payloadPlan(archivedLog)
         archivedLog("<s> kernel $release is served by the 64560 payload path")
         archivedLog(
             "<p> plan rounds=${plan.rounds} budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
@@ -529,8 +536,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return if (handover == 0) 0 else 1
     }
 
-    /** 编排参数 (design D3: host 侧设置, 不进 GLK1 wire)。 */
-    private fun payloadPlan(): PayloadBridge.Plan = PayloadBridge.Plan()
+    /**
+     * 编排参数 (design D3: host 侧设置, 不进 GLK1 wire)。
+     *
+     * 没有独立设置界面时也能改: 读 `ghostlock_prefs` 里的 `payload_*` 键, 缺省就是真机验证过的
+     * 那套值。取值全部走 [PayloadBridge.Plan] 的 require 边界, 非法值退回默认而不是带着脏参数开跑。
+     */
+    private fun payloadPlan(log: (String) -> Unit): PayloadBridge.Plan {
+        val defaults = PayloadBridge.Plan()
+        return runCatching {
+            PayloadBridge.Plan(
+                rounds = preferences.getInt(PrefPayloadRounds, defaults.rounds),
+                gateMilliCelsius = preferences.getInt(PrefPayloadGate, defaults.gateMilliCelsius),
+                panicMilliCelsius = preferences.getInt(PrefPayloadPanic, defaults.panicMilliCelsius),
+                quietSeconds = preferences.getInt(PrefPayloadQuiet, defaults.quietSeconds),
+                rebootEachRound = preferences.getBoolean(PrefPayloadReboot, defaults.rebootEachRound),
+            )
+        }.getOrElse { error ->
+            log("<s> payload plan override rejected: ${error.message}; using defaults")
+            defaults
+        }
+    }
 
     /**
      * 把 [PayloadRoundDriver.PayloadDevice] 接到 AIDL 原语上。驱动只做决策, 这里负责
