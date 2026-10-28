@@ -17,6 +17,58 @@ permissions:
   contents: write
 
 jobs:
+  # 单测只编译 JVM 侧; 这个 job 证明 APK 能真的打包出来 (AIDL stub、资源合并、native 预处理)。
+  build-debug-apk:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    env:
+      ONDK_VERSION: "r30.1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: zulu
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache ONDK
+        id: ondk-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ondk
+          key: ondk-${{ env.ONDK_VERSION }}-linux
+
+      - name: Download ONDK
+        if: steps.ondk-cache.outputs.cache-hit != 'true'
+        run: |
+          url="https://github.com/topjohnwu/ondk/releases/download/${ONDK_VERSION}/ondk-${ONDK_VERSION}-linux.tar.xz"
+          mkdir -p "${{ runner.temp }}/ondk"
+          curl -fL "$url" -o "${{ runner.temp }}/ondk.tar.xz"
+          tar -C "${{ runner.temp }}/ondk" --strip-components=1 -xf "${{ runner.temp }}/ondk.tar.xz"
+
+      - name: Link ONDK Rust toolchain
+        run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
+
+      - name: Assemble debug
+        run: |
+          export ONDK_HOME="${{ runner.temp }}/ondk"
+          export ANDROID_NDK_HOME="$ONDK_HOME"
+          export NDK_ROOT="$ONDK_HOME"
+          export CC_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          export AR_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          ./gradlew :app:assembleDebug --no-daemon
+
   unit-tests:
     name: JVM unit tests
     runs-on: ubuntu-latest
