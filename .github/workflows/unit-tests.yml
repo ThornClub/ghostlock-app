@@ -59,7 +59,7 @@ jobs:
       - name: Link ONDK Rust toolchain
         run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
 
-      - name: Assemble debug
+      - name: Assemble debug + release
         run: |
           export ONDK_HOME="${{ runner.temp }}/ondk"
           export ANDROID_NDK_HOME="$ONDK_HOME"
@@ -69,7 +69,30 @@ jobs:
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
           ./gradlew :app:assembleDebug --no-daemon
           # release 走 R8/资源收缩; 新增的 AIDL 方法也必须能在收缩后存活
-          ./gradlew :app:assembleRelease --no-daemon
+          ./gradlew :app:assembleRelease --no-daemon 2>&1 | tee "$RUNNER_TEMP/assemble.log"
+
+      - name: Publish build failure report
+        if: failure()
+        run: |
+          {
+            echo "# assemble failure"
+            echo
+            echo "sha: $GITHUB_SHA"
+            echo
+            echo '```'
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Caused by|Could not"               "$RUNNER_TEMP/assemble.log" | head -40 || true
+            echo '```'
+            echo
+            echo '```'
+            tail -n 80 "$RUNNER_TEMP/assemble.log"
+            echo '```'
+          } > ci-report.md
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -q -b ci-report
+          git add -f ci-report.md
+          git commit -q -m "ci: assemble failure report for ${GITHUB_SHA::7}"
+          git push --force origin ci-report
 
   unit-tests:
     name: JVM unit tests

@@ -644,11 +644,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         override fun rebootRound(): Boolean = runBlocking {
             val before = readBootId()
             val code = shizukuRunner.rebootDevice(log)
-            log("<p> reboot issued rc=$code (0 = command accepted)")
-            if (code != 0) {
-                log("<s> reboot was refused by this domain; continuing on the current boot")
+            /* 命令发出后 UserService 自己会被重启带走, 拿不到退出码是正常现象:
+             * null 表示"可能已发出", 仍然按 boot_id 变化来判定, 不当作失败。 */
+            if (code != null && code != 0) {
+                log("<s> reboot was refused (rc=$code); continuing on the current boot")
                 return@runBlocking false
             }
+            log("<p> reboot command rc=${code ?: "unknown, UserService dropped"}; waiting for boot_id")
             val changed = awaitBootChange(before)
             if (changed) lastBootId = readBootId()
             changed
