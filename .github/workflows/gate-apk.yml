@@ -71,9 +71,9 @@ jobs:
       - name: Name the asset
         run: |
           # 注意: 不要用 `find ... | head`, pipefail 下 head 关闭管道会让 find 以 141 退出。
-          apk="$(find . -name 'app-debug.apk' -print -quit)"
+          apk="$(find . -name '*-debug.apk' -print -quit)"
           if [ -z "$apk" ]; then
-            echo "app-debug.apk not found; apk outputs:"
+            echo "debug APK not found; apk outputs:"
             find . -name '*.apk' -print | head -20
             exit 1
           fi
