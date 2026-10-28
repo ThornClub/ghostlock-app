@@ -15,6 +15,7 @@ import com.ghostlock.app.domain.model.DebugSettings
 import com.ghostlock.app.domain.model.KernelSnapshot
 import com.ghostlock.app.domain.model.OffsetCandidate
 import com.ghostlock.app.data.ota.OtaPayloadExtractor
+import com.ghostlock.app.data.payload.PayloadBridge
 import com.ghostlock.app.domain.model.OffsetImportResult
 import com.ghostlock.app.domain.model.ParseResult
 import com.ghostlock.app.domain.model.ProfileConfig
@@ -161,6 +162,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             kernelRelease = release,
             socName = resolveSocName(),
             kernelSupported = isKernelSupported(),
+            payloadServed = PayloadBridge.isFindN5Kernel(release),
             cpuPairs = cpuPairs.toList(),
             cpuPairLabels = cpuPairLabels.toList(),
             selectedCpuPair = selectedCpuPair,
@@ -413,8 +415,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
         return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
-            archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
+            /* 载荷内核没有 native pipeline: 不加载 GLK1 profile, 直接走 64560 载荷路径。 */
+            if (PayloadBridge.isFindN5Kernel(release)) {
+                return@withDebugAttackLog runPayloadPath(release, archivedLog)
+            }
+            archivedLog("<s> resolving profile")
             val config = profileController.load(release, pair)
             val profileBlob = profileController.nativeDocument(config)
             archivedLog(
@@ -455,6 +461,22 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
             }
         }
+    }
+
+    /**
+     * 64560 载荷路径。该内核没有 native pipeline, 也不加载 GLK1 profile。
+     * 本批次只跑一轮载荷 (round 1 fanout, 与真机验证的起点一致);
+     * 轮次驱动、温度门与 KSU handover 在后续批次接线。
+     */
+    private suspend fun runPayloadPath(release: String, archivedLog: (String) -> Unit): Int {
+        val plan = PayloadBridge.Plan()
+        archivedLog("<s> kernel $release is served by the 64560 payload path")
+        archivedLog(
+            "<p> payload=${PayloadBridge.payloadFor(rotate = false)} " +
+                "budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
+                "gate=${plan.gateMilliCelsius}mC",
+        )
+        return shizukuRunner.runPayload(rotate = false, plan = plan, onLog = archivedLog)
     }
 
     /* --- attack step status ------------------------------------------------
@@ -933,7 +955,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private fun isKernelSupported(): Boolean {
         val version = System.getProperty("os.version", "").orEmpty()
-        return version in builtinProfiles.unames || importedOffsetsMatch(version)
+        return KernelSupport.isSupported(version, builtinProfiles.unames, importedOffsetsMatch(version))
     }
 
     private fun importedOffsetsMatch(version: String): Boolean =

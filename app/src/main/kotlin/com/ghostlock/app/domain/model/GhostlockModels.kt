@@ -9,6 +9,8 @@ data class KernelSnapshot(
     val kernelRelease: String,
     val socName: String = "",
     val kernelSupported: Boolean,
+    /** 该内核由 64560 载荷服务: 没有 native pipeline, 也不加载 GLK1 profile。 */
+    val payloadServed: Boolean = false,
     val cpuPairs: List<CpuPair>,
     val cpuPairLabels: List<String>,
     val selectedCpuPair: Int,

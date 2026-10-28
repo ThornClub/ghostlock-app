@@ -870,8 +870,9 @@ class GhostlockViewModel(
     fun onProfileInvalid() {
         val state = state.value
         val messageRes = when {
-            !state.executionHasProfile -> R.string.run_blocked_no_profile
-            state.shizukuEnabled && state.shizukuStatus != ShizukuStatus.READY ->
+            !state.executionHasProfile && !state.payloadServed -> R.string.run_blocked_no_profile
+            (state.shizukuEnabled || state.payloadServed) &&
+                state.shizukuStatus != ShizukuStatus.READY ->
                 R.string.run_blocked_shizuku
 
             else -> R.string.profile_invalid
@@ -902,7 +903,8 @@ class GhostlockViewModel(
             }
             return
         }
-        val useShizuku = snapshot.shizukuEnabled
+        /* 载荷内核只能经 UserService 执行: 没有 native pipeline 可用。 */
+        val useShizuku = snapshot.shizukuEnabled || snapshot.payloadServed
         if (useShizuku && snapshot.shizukuStatus != ShizukuStatus.READY) {
             onStatusClick()
             return
@@ -1068,10 +1070,15 @@ class GhostlockViewModel(
     private suspend fun refreshSnapshot() {
         val snapshot = withContext(Dispatchers.IO) { loadKernelSnapshot() }
         /* Validate the resolved profile here so the run button can grey out. */
-        val loaded = withContext(Dispatchers.IO) {
-            val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
-                ?: return@withContext null
-            runCatching { profileController.load(snapshot.kernelRelease, pair) }.getOrNull()
+        /* 载荷内核没有 native pipeline, 不解析 GLK1 profile: 也就不会有非法字段挡住 Run。 */
+        val loaded = if (snapshot.payloadServed) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
+                    ?: return@withContext null
+                runCatching { profileController.load(snapshot.kernelRelease, pair) }.getOrNull()
+            }
         }
         kernelSnapshot = snapshot
         mutableState.update {
@@ -1080,6 +1087,7 @@ class GhostlockViewModel(
                 kernelRelease = snapshot.kernelRelease,
                 socName = snapshot.socName,
                 kernelSupported = snapshot.kernelSupported,
+                payloadServed = snapshot.payloadServed,
                 cpuPairLabels = snapshot.cpuPairLabels,
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,

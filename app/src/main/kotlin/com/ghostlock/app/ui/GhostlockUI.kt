@@ -107,6 +107,8 @@ data class GhostlockUiState(
     val kernelRelease: String = "",
     val socName: String = "",
     val kernelSupported: Boolean = false,
+    /** 该内核由 64560 载荷服务, 不走 native pipeline 也不需 GLK1 profile。 */
+    val payloadServed: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
     val running: Boolean = false,
@@ -808,8 +810,8 @@ private fun MainContent(
             RunButton(
                 running = state.running,
                 supported = state.kernelSupported &&
-                        state.executionHasProfile &&
-                        (!state.shizukuEnabled ||
+                        (state.executionHasProfile || state.payloadServed) &&
+                        ((!state.shizukuEnabled && !state.payloadServed) ||
                                 state.shizukuStatus == ShizukuStatus.READY),
                 profileValid = state.profileInvalidPaths.isEmpty(),
                 labelRes = R.string.action_run,
@@ -830,7 +832,8 @@ private fun ControlPanel(
     Column(modifier = modifier) {
         ActivationStatusCard(
             supported = state.kernelSupported,
-            profileAvailable = state.executionHasProfile,
+            payloadServed = state.payloadServed,
+            profileAvailable = state.executionHasProfile || state.payloadServed,
             profileValid = state.profileInvalidPaths.isEmpty(),
             shizukuEnabled = state.shizukuEnabled,
             shizukuStatus = state.shizukuStatus,
@@ -913,6 +916,7 @@ private fun ControlPanel(
 @Composable
 private fun ActivationStatusCard(
     supported: Boolean,
+    payloadServed: Boolean,
     profileAvailable: Boolean,
     profileValid: Boolean,
     shizukuEnabled: Boolean,
@@ -952,6 +956,7 @@ private fun ActivationStatusCard(
         )
     }
     val summary = when {
+        payloadServed -> R.string.kernel_payload_path_summary
         ready && shizukuEnabled -> R.string.kernel_profile_ready_shizuku
         ready -> R.string.kernel_profile_ready
         !supported -> R.string.kernel_unsupported_summary

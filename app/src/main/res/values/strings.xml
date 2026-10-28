@@ -76,6 +76,7 @@
     <string name="kernel_unsupported_summary">No matching kernel profile</string>
     <string name="kernel_profile_required_summary">Load a profile to continue</string>
     <string name="kernel_profile_invalid_summary">Correct the marked fields</string>
+    <string name="kernel_payload_path_summary">Payload path for this kernel; no profile needed</string>
     <string name="cpu_pair_custom">Custom (%1$s)</string>
     <string name="cpu_pair_label">CPU cores</string>
     <string name="safe_mode_label">Safe mode</string>
