@@ -1,5 +1,6 @@
 package com.ghostlock.app.data.profile
 
+import com.ghostlock.app.data.ValueMap
 import com.ghostlock.app.data.asValueMap
 import com.ghostlock.app.data.valueMapOf
 import org.junit.Assert.assertEquals
@@ -48,5 +49,37 @@ class ProfileMergerTest {
         val selected = resolved["execution"].asValueMap()!!["selected_cpus"].asValueMap()!!
         assertEquals(3L, selected["main"])
         assertEquals(4L, selected["consumer"])
+    }
+
+    @Test
+    fun `merging one profile never mutates the shared tuning map`() {
+        /* 导出器只解析一次 execution-tuning.conf 就循环全部 profile; 若 merge 原地写回,
+         * 上一个 profile 的 execution 值会漏到下一个 (6.1.134 的 w1_attempts=25 就这样
+         * 污染了 6.1.138-g0c3d559bcd85)。 */
+        val tuning = valueMapOf(
+            "stages" to valueMapOf("w1_attempts" to 15L, "w2_attempts" to 15L),
+        )
+        val polluting = valueMapOf(
+            "release" to "polluter",
+            "execution" to valueMapOf("stages" to valueMapOf("w1_attempts" to 25L)),
+        )
+        val plain = valueMapOf("release" to "plain")
+
+        fun resolve(builtin: ValueMap) = ProfileMerger.resolveMerged(
+            deviceRelease = "plain",
+            builtin = builtin,
+            imported = null,
+            overrides = null,
+            tuningExecution = tuning,
+            pair = CpuPairView(0, 1),
+            routePresets = emptyMap(),
+        )
+
+        val polluted = resolve(polluting)["execution"].asValueMap()!!["stages"].asValueMap()!!
+        assertEquals(25L, polluted["w1_attempts"])
+
+        val after = resolve(plain)["execution"].asValueMap()!!["stages"].asValueMap()!!
+        assertEquals(15L, after["w1_attempts"])
+        assertEquals(15L, tuning["stages"].asValueMap()!!["w1_attempts"])
     }
 }

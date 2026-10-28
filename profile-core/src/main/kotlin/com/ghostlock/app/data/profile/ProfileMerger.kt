@@ -29,8 +29,11 @@ object ProfileMerger {
         pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
+        /* deepMergeValues 原地写 base, 而 tuning 由调用方持有并在多个 profile 间复用:
+         * 直接用引用会让上一个 profile 的 execution 值污染下一个 (导出 6.1.138-g0c3d559bcd85
+         * 的 w1_attempts 就因此从 15 变成上一个 profile 的 25)。 */
         val defaults = valueMapOf("release" to deviceRelease).apply {
-            if (tuningExecution != null) put("execution", tuningExecution)
+            if (tuningExecution != null) put("execution", tuningExecution.copyValue())
         }
         val resolved = mergeSource(
             mergeSource(
@@ -62,7 +65,8 @@ object ProfileMerger {
             val defaults = routePresets[route] ?: continue
             val existing = routes[route].asValueMap()
             if (existing == null) {
-                routes[route] = defaults
+                /* 预设也被跨 profile 复用: 存引用会让后续的键写入回灌到 preset 里。 */
+                routes[route] = defaults.copyValue()
                 continue
             }
             for ((key, value) in defaults) {
