@@ -47,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: unit-test-report
-          path: app/build/reports/tests
+          path: build/app/reports/tests
           if-no-files-found: ignore
 
       # 包装器日志默认要 token 才能读; 把失败摘要推到 ci-report 分支, 任何人有仓读权限就能看。
@@ -71,9 +71,9 @@ jobs:
             echo "## JUnit failure details"
             echo
             echo '```'
-            find app/build -path '*test-results*' -name '*.xml' -print 2>/dev/null | head -5
+            find build -path '*test-results*' -name '*.xml' -print 2>/dev/null | head -5
             echo '---'
-            find app/build -path '*test-results*' -name '*.xml' -exec grep -h -A6 '<failure' {} + 2>/dev/null | head -100 || true
+            find build -path '*test-results*' -name '*.xml' -exec grep -h -A6 '<failure' {} + 2>/dev/null | head -100 || true
             echo '```'
           } > ci-report.md
           git config user.name "github-actions"
