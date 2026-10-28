@@ -3,6 +3,7 @@ package com.ghostlock.app.data.payload
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -121,5 +122,19 @@ class PayloadBridgeTest {
     fun `kmi is null when the release has no android tag`() {
         assertNull(PayloadBridge.kmiFor("6.6.118-generic"))
         assertNull(PayloadBridge.kmiFor(""))
+    }
+
+    @Test
+    fun `invalid plan values are rejected so settings can fall back`() {
+        /* payloadPlan() 用 runCatching 包住构造: 非法覆盖值必须在这里就被挡住。 */
+        assertThrows(IllegalArgumentException::class.java) {
+            PayloadBridge.Plan(rounds = 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PayloadBridge.Plan(gateMilliCelsius = 80_000, panicMilliCelsius = 70_000)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PayloadBridge.Plan(quietSeconds = -1)
+        }
     }
 }
