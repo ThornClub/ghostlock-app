@@ -26,6 +26,7 @@ import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
@@ -93,7 +94,31 @@ class GhostlockViewModel(
             refreshSnapshot()
             applyRecommendedShizuku()
             maybeSuggestShizukuForW3()
+            maybeResumePayloadRun()
         }
+    }
+
+    /**
+     * 载荷路径每跑一轮就可能重启设备, app 会跟着一起死。重新打开 app 时若还有未完成的会话,
+     * 就从下一轮接着跑; Shizuku 刚开机可能还没就绪, 所以先等它一会儿。
+     */
+    private suspend fun maybeResumePayloadRun() {
+        if (kernelSnapshot?.payloadServed != true) return
+        if (repository.pendingPayloadRound() == null) return
+        appendLog("<p> unfinished payload run found; waiting for Shizuku")
+        repeat(20) {
+            if (repository.pendingPayloadRound() == null) return
+            refreshSnapshot()
+            val snapshot = kernelSnapshot
+            val round = repository.pendingPayloadRound()
+            if (snapshot != null && round != null && snapshot.shizukuStatus == ShizukuStatus.READY) {
+                appendLog("<p> resuming payload run at round $round")
+                runExploit()
+                return
+            }
+            delay(3000)
+        }
+        appendLog("<s> Shizuku not ready yet; press 执行 to resume the payload run")
     }
 
     private var recommendedShizukuApplied = false
@@ -924,6 +949,12 @@ class GhostlockViewModel(
                 send(GhostlockEffect.KeepScreenAwake(false))
             }
         }
+    }
+
+    /** 停止正在跑的载荷 run: 清会话, 当前轮结束后不再继续。 */
+    fun stopPayloadRun() {
+        repository.cancelPayloadRun()
+        appendLog("<p> payload run cancelled")
     }
 
     fun onCloseExecutionSheet() {

@@ -24,6 +24,7 @@ import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.shizuku.ShizukuExploitRunner
 import com.ghostlock.app.data.payload.PayloadRoundDriver
+import com.ghostlock.app.data.payload.PayloadRunSessionStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -94,6 +95,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
     private val offsetsFile get() = File(filesDir, OffsetsFileName)
     private val builtinProfiles = BuiltinProfileCatalog(appContext)
+    private val payloadSession = PayloadRunSessionStore(preferences)
+
+    /** 停止请求: 与落盘会话一起构成 driver 的取消条件。 */
+    @Volatile
+    private var payloadStopRequested = false
     private val assetConfigLoader = AssetConfigLoader(appContext)
     private val userProfileStore = UserProfileStore(
         directory = File(filesDir, UserProfilesDirectoryName),
@@ -431,6 +437,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
         }
 
+    /** 有未完成的载荷 run 时返回下一轮轮次 (1 起), 否则 null。 */
+    override fun pendingPayloadRound(): Int? = payloadSession.load()?.nextRound
+
+    override fun cancelPayloadRun() {
+        payloadStopRequested = true
+        payloadSession.finish()
+    }
+
     override suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int {
         return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
             val release = System.getProperty("os.version", "").orEmpty()
@@ -491,6 +505,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         archivedLog: (String) -> Unit,
     ): Int {
         val plan = payloadPlan(archivedLog)
+        val session = payloadSession.load()
+        val startRound = session?.nextRound?.coerceIn(1, plan.rounds) ?: 1
+        if (session == null) {
+            payloadSession.start(plan.rounds)
+        } else {
+            archivedLog(
+                "<p> resuming payload run at round $startRound/${plan.rounds} " +
+                    "(the device rebooted in the previous round)",
+            )
+        }
+        payloadStopRequested = false
         archivedLog("<s> kernel $release is served by the 64560 payload path")
         archivedLog(
             "<p> plan rounds=${plan.rounds} budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
@@ -518,10 +543,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
             },
             onLog = archivedLog,
+            startRound = startRound,
+            onRoundStarting = { round -> payloadSession.advance(round) },
+            isCancelled = { payloadStopRequested },
         )
         val summary = driver.run()
         writePayloadDiagnostics(summary, plan, writeSidecar, archivedLog)
 
+        payloadSession.finish()
         val holdRound = summary.holdRound
         if (holdRound == null) {
             archivedLog(

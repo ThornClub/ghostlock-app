@@ -122,6 +122,17 @@ interface GhostlockRepository {
     suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int
 
     /**
+     * 未完成的载荷 run 的下一轮 (1 起); null 表示没有会话。
+     *
+     * 载荷路径每跑一轮就可能重启设备, 而 app 会跟着一起死, 所以进度必须落盘; 调用方在启动时
+     * 用这个方法决定要不要续跑。
+     */
+    fun pendingPayloadRound(): Int?
+
+    /** 取消载荷 run: 清掉会话, 让正在跑的轮次收尾后停止。 */
+    fun cancelPayloadRun()
+
+    /**
      * The step left `in_progress` by the previous run (usually a kernel panic),
      * or null when the last run completed/failed cleanly. `w3*` means Shizuku
      * (shell uid, no seccomp) can skip that stage.

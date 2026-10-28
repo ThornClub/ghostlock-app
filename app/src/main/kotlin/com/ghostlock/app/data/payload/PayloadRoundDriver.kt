@@ -16,6 +16,15 @@ class PayloadRoundDriver(
     private val clock: Clock,
     private val onRound: (RoundRecord) -> Unit = {},
     private val onLog: (String) -> Unit = {},
+    /**
+     * 会话续跑: 上一轮之后设备重启过, 从这一轮继续。
+     * 重启会把 app 一起带走, 所以进度只能靠调用方落盘后再交回来。
+     */
+    private val startRound: Int = 1,
+    /** 每轮开始前通知调用方落盘 (崩在这一轮时下次重跑同一轮)。 */
+    private val onRoundStarting: (Int) -> Unit = {},
+    /** 用户取消 (停止按钮 / 会话被清掉)。 */
+    private val isCancelled: () -> Boolean = { false },
 ) {
     /** 一轮的最终判定 (工具里对应 HOLD / MISS / CRASH / HOTABORT / REJECT)。 */
     enum class RoundResult {
@@ -123,7 +132,12 @@ class PayloadRoundDriver(
         var fastLeft = 0
         var holdRound: Int? = null
 
-        for (round in 1..plan.rounds) {
+        for (round in startRound..plan.rounds) {
+            if (isCancelled()) {
+                onLog("<p> payload run cancelled before round $round")
+                return RunSummary(records, holdRound, aborted = true, abortReason = "cancelled")
+            }
+            onRoundStarting(round)
             val gate = awaitCooling(plan.gateMilliCelsius, plan.coolTimeoutSeconds)
             if (gate == CoolGate.Timeout) {
                 onLog("<p> cooling timed out before round $round; stopping")
@@ -188,6 +202,10 @@ class PayloadRoundDriver(
             if (result == RoundResult.Hold) {
                 holdRound = round
                 return RunSummary(records, holdRound, aborted = false, abortReason = null)
+            }
+            if (isCancelled()) {
+                onLog("<p> payload run cancelled after round $round")
+                return RunSummary(records, holdRound, aborted = true, abortReason = "cancelled")
             }
             if (result == RoundResult.Rejected) {
                 onLog("<p> payload rejected this device; no round can change that")

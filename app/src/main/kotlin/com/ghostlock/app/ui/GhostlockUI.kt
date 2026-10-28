@@ -187,6 +187,7 @@ data class GhostlockLogLine(val text: String, val color: Int)
 
 interface GhostlockActions {
     fun onRun()
+    fun onStopRun()
     fun onProfileInvalid()
     fun onStatusClick()
     fun onCloseExecutionSheet()
@@ -447,12 +448,24 @@ private fun GhostlockExecutionSheet(
         allowDismiss = state.executionSheetDismissible,
         onDismissRequest = actions::onCloseExecutionSheet,
         startAction = {
-            IconButton(onClick = actions::onCopyLogs) {
-                Icon(
-                    imageVector = MiuixIcons.Copy,
-                    contentDescription = stringResource(R.string.action_copy),
-                    tint = MiuixTheme.colorScheme.onBackground,
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                /* 载荷路径一轮就可能重启设备, 必须能给用户一个停止入口。 */
+                if (state.running) {
+                    IconButton(onClick = actions::onStopRun) {
+                        Icon(
+                            imageVector = Icons.Rounded.RemoveCircleOutline,
+                            contentDescription = stringResource(R.string.action_stop),
+                            tint = MiuixTheme.colorScheme.onBackground,
+                        )
+                    }
+                }
+                IconButton(onClick = actions::onCopyLogs) {
+                    Icon(
+                        imageVector = MiuixIcons.Copy,
+                        contentDescription = stringResource(R.string.action_copy),
+                        tint = MiuixTheme.colorScheme.onBackground,
+                    )
+                }
             }
         },
         endAction = {
