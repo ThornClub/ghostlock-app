@@ -66,7 +66,7 @@ jobs:
           export CC_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
           export AR_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
-          ./gradlew :app:assembleDebug --no-daemon
+          ./gradlew :app:assembleDebug --no-daemon 2>&1 | tee "$RUNNER_TEMP/assemble.log"
 
       - name: Name the asset
         run: |
@@ -81,6 +81,34 @@ jobs:
           sha="$(git rev-parse --short HEAD)"
           cp "$apk" "GhostLock-debug-${sha}.apk"
           ls -l GhostLock-debug-*.apk
+
+      - name: Report gate failure
+        if: failure()
+        run: |
+          {
+            echo "# gate-apk failure"
+            echo
+            echo "sha: $GITHUB_SHA"
+            echo
+            echo '## apk candidates'
+            echo '```'
+            find . -name '*.apk' -print 2>/dev/null || true
+            echo '```'
+            echo '## outputs tree'
+            echo '```'
+            ls -R build/app/outputs 2>/dev/null || echo "no build/app/outputs"
+            echo '```'
+            echo '## gradle output tail'
+            echo '```'
+            tail -n 40 "$RUNNER_TEMP"/*.log 2>/dev/null || echo "no logs"
+            echo '```'
+          } > ci-report.md
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -q -b ci-report
+          git add -f ci-report.md
+          git commit -q -m "ci: gate-apk failure report for ${GITHUB_SHA::7}"
+          git push --force origin ci-report
 
       - name: Publish pre-release
         uses: softprops/action-gh-release@v2
