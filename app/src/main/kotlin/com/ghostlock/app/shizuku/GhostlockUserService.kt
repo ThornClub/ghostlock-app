@@ -524,13 +524,13 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
      * stdin, 结果从载荷日志里的标记读回。返回 0 仅当 /proc/modules 里 kernelsu 处于
      * Live; insmod 成功但 install 失败会返回 1, 与真机 diag 的失败形态一致。
      */
-    override fun handoverKernelSU(managerPackage: String?, callback: IGhostlockCallback) {
+    override fun handoverKernelSU(managerPackage: String?, callback: IGhostlockCallback): Int {
         val process = payloadProcess
         val log = payloadLog
         if (process == null || !process.isAlive || log == null) {
             runCatching { callback.onLog("<s> ksu: no live root child; nothing to hand over") }
             runCatching { callback.onComplete(1) }
-            return
+            return 1
         }
         val code = runCatching { runKernelSuHandover(process, log, managerPackage, callback) }
             .getOrElse { error ->
@@ -538,6 +538,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 1
             }
         runCatching { callback.onComplete(code) }
+        return code
     }
 
     private fun runKernelSuHandover(
