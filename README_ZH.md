@@ -14,6 +14,8 @@ GhostLock 利用 CVE-2026-43499 在支持的 Android 内核上获取临时 root�
 
 如果启用了 Shizuku，请先通过 ADB 启动，再运行 GhostLock。点击 GhostLock 的状态卡授权。
 
+任何自带 `libksud.so` 的 root 管理器都可提供 `ksud` 用于加载模块。内置列表（KernelSU、ReSukiSU、BakaSU、KowSU）会自动检测；其他管理器可在 **设置 → 根管理器** 中手动选择。缺 `ksud` 时 W1/W2 仍可拿到 uid 0，但不会加载模块。
+
 ## 添加内核 profile
 
 无需重新打包 App 即可导入 profile：
