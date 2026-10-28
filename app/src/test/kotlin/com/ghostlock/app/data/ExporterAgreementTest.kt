@@ -2,6 +2,7 @@ package com.ghostlock.app.data
 
 import android.app.Application
 import androidx.core.content.edit
+import com.ghostlock.app.data.NativeProfileDocument
 import com.ghostlock.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
@@ -63,14 +64,30 @@ class ExporterAgreementTest {
                     "$release: app has no native document"
                 }
                 val exporterBytes = File(exporterDir, "$release.bin").readBytes()
-                /* 失败时要能直接看出差在哪个字节, 而不是只拿到两份数组。 */
-                val firstDiff = appBytes.indices.firstOrNull { appBytes[it] != exporterBytes.getOrNull(it) }
-                assertArrayEquals(
-                    "$release: exporter differs from the app " +
-                        "(len app=${appBytes.size} exporter=${exporterBytes.size}, firstDiff=$firstDiff)",
-                    appBytes,
-                    exporterBytes,
+                /* 先按分组解码比较: 失败消息直接指出哪一组不同, 而不是两份 1903 字节数组。 */
+                val appDoc = requireNotNull(NativeProfileDocument.fromBinary(appBytes)) { "$release: app document does not decode" }
+                val exporterDoc = requireNotNull(NativeProfileDocument.fromBinary(exporterBytes)) { "$release: exporter document does not decode" }
+                assertEquals("$release: task_struct", appDoc.taskStruct, exporterDoc.taskStruct)
+                assertEquals("$release: cred template", appDoc.cred, exporterDoc.cred)
+                assertEquals("$release: kernel offset table", appDoc.kernelOffset, exporterDoc.kernelOffset)
+                assertEquals("$release: execution tuning", appDoc.execution, exporterDoc.execution)
+                assertEquals("$release: route config", appDoc.routeConfig, exporterDoc.routeConfig)
+                assertEquals(
+                    "$release: header scalars",
+                    listOf(
+                        appDoc.release, appDoc.routeKind, appDoc.kernelMajor, appDoc.recommendShizuku,
+                        appDoc.fallbackRoute, appDoc.kernelPhysLoad, appDoc.kernelPhysOffset,
+                        appDoc.compactWaiter, appDoc.kernelsnitchCollisions, appDoc.mmStructSz, appDoc.safeMode,
+                    ),
+                    listOf(
+                        exporterDoc.release, exporterDoc.routeKind, exporterDoc.kernelMajor,
+                        exporterDoc.recommendShizuku, exporterDoc.fallbackRoute, exporterDoc.kernelPhysLoad,
+                        exporterDoc.kernelPhysOffset, exporterDoc.compactWaiter,
+                        exporterDoc.kernelsnitchCollisions, exporterDoc.mmStructSz, exporterDoc.safeMode,
+                    ),
                 )
+                /* 最后才是权威的逐字节一致。 */
+                assertArrayEquals("$release: exporter differs from the app", appBytes, exporterBytes)
             }
         } finally {
             root.deleteRecursively()
