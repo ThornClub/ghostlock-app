@@ -71,6 +71,8 @@ class PayloadRoundDriver(
         val strayLeft: Int,
         val quietSeconds: Int,
         val spray: SprayHealth?,
+        /** 该轮载荷日志尾部, 诊断导出直接落盘。 */
+        val logTail: String = "",
     )
 
     /** 整个 run 的结局。 */
@@ -178,6 +180,7 @@ class PayloadRoundDriver(
                 strayLeft = strayLeft,
                 quietSeconds = quiet,
                 spray = sprayHealth(tail),
+                logTail = tail,
             )
             records.add(record)
             onRound(record)

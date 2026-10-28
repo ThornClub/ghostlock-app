@@ -23,9 +23,13 @@ import com.ghostlock.app.domain.model.UserProfileFile
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.shizuku.ShizukuExploitRunner
+import com.ghostlock.app.data.payload.PayloadRoundDriver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -51,6 +55,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugExportLocation = "debug_export_location"
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
+
+        /* 64560 载荷编排 (design D1/D4): 轮内日志尾部、UserService 退出码与几个等待上限。 */
+        const val RoundTailLines = 40
+        const val PayloadExitStalled = 3
+        const val PollMs = 2_000L
+        const val OnlineWaitMs = 180_000L
+        const val BootWaitMs = 300_000L
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -418,7 +429,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val release = System.getProperty("os.version", "").orEmpty()
             /* 载荷内核没有 native pipeline: 不加载 GLK1 profile, 直接走 64560 载荷路径。 */
             if (PayloadBridge.isFindN5Kernel(release)) {
-                return@withDebugAttackLog runPayloadPath(release, archivedLog)
+                return@withDebugAttackLog runPayloadPath(release, writeSidecar, archivedLog)
             }
             archivedLog("<s> resolving profile")
             val config = profileController.load(release, pair)
@@ -464,19 +475,236 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     /**
-     * 64560 载荷路径。该内核没有 native pipeline, 也不加载 GLK1 profile。
-     * 本批次只跑一轮载荷 (round 1 fanout, 与真机验证的起点一致);
-     * 轮次驱动、温度门与 KSU handover 在后续批次接线。
+     * 64560 载荷路径。该内核没有 native pipeline, 也不加载 GLK1 profile:
+     * 轮次驱动 (多轮 / 温度门 / 崩溃重置) 与 KSU handover 都在这里组装。
      */
-    private suspend fun runPayloadPath(release: String, archivedLog: (String) -> Unit): Int {
-        val plan = PayloadBridge.Plan()
+    private suspend fun runPayloadPath(
+        release: String,
+        writeSidecar: (String, ByteArray) -> Boolean,
+        archivedLog: (String) -> Unit,
+    ): Int {
+        val plan = payloadPlan()
         archivedLog("<s> kernel $release is served by the 64560 payload path")
         archivedLog(
-            "<p> payload=${PayloadBridge.payloadFor(rotate = false)} " +
-                "budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
-                "gate=${plan.gateMilliCelsius}mC",
+            "<p> plan rounds=${plan.rounds} budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
+                "gate=${plan.gateMilliCelsius}mC panic=${plan.panicMilliCelsius}mC " +
+                "rebootEachRound=${plan.rebootEachRound}",
         )
-        return shizukuRunner.runPayload(rotate = false, plan = plan, onLog = archivedLog)
+        val device = AndroidPayloadDevice(plan, archivedLog)
+        val driver = PayloadRoundDriver(
+            plan = plan,
+            device = device,
+            clock = WallClock(),
+            onRound = { record ->
+                archivedLog(
+                    "<p> round ${record.round}/${plan.rounds} result=${record.result} " +
+                        "payload=${record.payload} gate=${record.coolGate} " +
+                        "peak=${record.peakMilliCelsius ?: 0}mC took=${record.durationMillis}ms",
+                )
+                record.spray?.let { health ->
+                    if (health.short) {
+                        archivedLog(
+                            "<p> spray short: ${health.timers}/${health.timerGoal} " +
+                                "create_errno=${health.createErrno}",
+                        )
+                    }
+                }
+            },
+            onLog = archivedLog,
+        )
+        val summary = driver.run()
+        writePayloadDiagnostics(summary, plan, writeSidecar, archivedLog)
+
+        val holdRound = summary.holdRound
+        if (holdRound == null) {
+            archivedLog(
+                "<s> no hold after ${summary.records.size} round(s)" +
+                    (summary.abortReason?.let { " (aborted: $it)" } ?: ""),
+            )
+            return if (summary.abortReason == "rejected") 2 else 1
+        }
+        archivedLog("<p> held a root child on round $holdRound; starting KernelSU handover")
+        val handover = shizukuRunner.handoverKernelSU(selectedManagerPackage(), archivedLog)
+        archivedLog("<p> handover result=$handover (0 means kernelsu Live)")
+        return if (handover == 0) 0 else 1
+    }
+
+    /** 编排参数 (design D3: host 侧设置, 不进 GLK1 wire)。 */
+    private fun payloadPlan(): PayloadBridge.Plan = PayloadBridge.Plan()
+
+    /**
+     * 把 [PayloadRoundDriver.PayloadDevice] 接到 AIDL 原语上。驱动只做决策, 这里负责
+     * 阻塞式调用 UserService, 并在轮内按 pollSeconds 采样温度、越 panic 门就杀载荷。
+     */
+    private inner class AndroidPayloadDevice(
+        private val plan: PayloadBridge.Plan,
+        private val log: (String) -> Unit,
+    ) : PayloadRoundDriver.PayloadDevice {
+        @Volatile
+        private var lastBootId: String = readBootId()
+
+        override fun maxThermalMilliCelsius(): Int? =
+            runBlocking { shizukuRunner.maxThermalMilliCelsius(log) }?.takeIf { it > 0 }
+
+        override fun isOnline(): Boolean = shizukuRunner.isBinderAlive()
+
+        override fun killStrayPayloads(): Int =
+            runBlocking { shizukuRunner.killStrayPayloads(log) } ?: -1
+
+        override fun runRound(
+            rotate: Boolean,
+            onTemperature: (Int) -> Unit,
+            onLogTail: (String) -> Unit,
+        ): PayloadRoundDriver.RoundSignals = runBlocking {
+            var exitCode = -1
+            var sawHold = false
+            var sawReject = false
+            var hotSamples = 0
+            var hotAbort = false
+            val tail = ArrayDeque<String>()
+
+            val job = launch {
+                exitCode = shizukuRunner.runPayload(rotate, plan, onLog = { line ->
+                    synchronized(tail) {
+                        tail.addLast(line)
+                        while (tail.size > RoundTailLines) tail.removeFirst()
+                        onLogTail(tail.joinToString("\n"))
+                    }
+                    log(line)
+                    when (PayloadBridge.classify(line)) {
+                        PayloadBridge.Outcome.Hold -> sawHold = true
+                        PayloadBridge.Outcome.Rejected -> sawReject = true
+                        else -> Unit
+                    }
+                })
+            }
+
+            while (job.isActive) {
+                val celsius = shizukuRunner.maxThermalMilliCelsius(log)
+                if (celsius != null && celsius > 0) {
+                    onTemperature(celsius)
+                    hotSamples = if (celsius >= plan.panicMilliCelsius) hotSamples + 1 else 0
+                    if (hotSamples >= 2) {
+                        /* 连续两次越过 panic 门: 与工具一致, 先杀载荷再收尾, 记为 HOTABORT。 */
+                        hotAbort = true
+                        log("<p> panic gate: ${celsius}mC >= ${plan.panicMilliCelsius}mC, killing the payload")
+                        shizukuRunner.killStrayPayloads(log)
+                        job.cancel()
+                        break
+                    }
+                }
+                delay(plan.pollSeconds * 1000L)
+            }
+            job.join()
+
+            PayloadRoundDriver.RoundSignals(
+                sawHold = sawHold,
+                sawReject = sawReject,
+                stalled = !sawHold && !sawReject && !hotAbort && exitCode == PayloadExitStalled,
+                sawHotAbort = hotAbort,
+                onlineAfterExit = shizukuRunner.isBinderAlive(),
+            )
+        }
+
+        override fun rebootRound(): Boolean = runBlocking {
+            val before = readBootId()
+            val code = shizukuRunner.rebootDevice(log)
+            log("<p> reboot issued rc=$code (0 = command accepted)")
+            if (code != 0) {
+                log("<s> reboot was refused by this domain; continuing on the current boot")
+                return@runBlocking false
+            }
+            val changed = awaitBootChange(before)
+            if (changed) lastBootId = readBootId()
+            changed
+        }
+
+        override fun waitForBootCompleted(): Boolean = runBlocking {
+            val changed = awaitBootChange(lastBootId)
+            if (changed) lastBootId = readBootId()
+            changed
+        }
+
+        override fun waitForOnline(): Boolean = runBlocking {
+            val deadline = System.currentTimeMillis() + OnlineWaitMs
+            while (System.currentTimeMillis() < deadline) {
+                if (shizukuRunner.isBinderAlive()) return@runBlocking true
+                delay(PollMs)
+            }
+            shizukuRunner.isBinderAlive()
+        }
+
+        /** 等 boot_id 变化 (等价于"设备真的重启过"); boot_id 不可读时退化为等 binder 恢复。 */
+        private suspend fun awaitBootChange(previous: String): Boolean {
+            val deadline = System.currentTimeMillis() + BootWaitMs
+            var sawOffline = false
+            while (System.currentTimeMillis() < deadline) {
+                if (!shizukuRunner.isBinderAlive()) sawOffline = true
+                val current = readBootId()
+                if (previous.isNotEmpty() && current.isNotEmpty() && current != previous) return true
+                if (previous.isEmpty() && sawOffline && shizukuRunner.isBinderAlive()) return true
+                delay(PollMs)
+            }
+            log("<s> boot did not complete within ${BootWaitMs / 1000}s")
+            return false
+        }
+
+        private fun readBootId(): String = runCatching {
+            File("/proc/sys/kernel/random/boot_id").readText().trim()
+        }.getOrDefault("")
+    }
+
+    /** 真实时钟; 单测用假时钟, 生产就按秒睡。 */
+    private class WallClock : PayloadRoundDriver.Clock {
+        override fun nowMillis(): Long = System.currentTimeMillis()
+        override fun sleepSeconds(seconds: Int) {
+            if (seconds > 0) Thread.sleep(seconds * 1000L)
+        }
+    }
+
+    /**
+     * 诊断导出 (AC5): 一份轮次汇总加每轮日志尾部, 字段对齐工具的 diag.txt。
+     */
+    private fun writePayloadDiagnostics(
+        summary: PayloadRoundDriver.RunSummary,
+        plan: PayloadBridge.Plan,
+        writeSidecar: (String, ByteArray) -> Boolean,
+        log: (String) -> Unit,
+    ) {
+        val text = buildString {
+            appendLine("# 64560 payload run")
+            appendLine("release: ${System.getProperty("os.version", "").orEmpty()}")
+            appendLine(
+                "plan: rounds=${plan.rounds} budget=${plan.budgetSeconds}s stall=${plan.stallSeconds}s " +
+                    "gate=${plan.gateMilliCelsius}mC panic=${plan.panicMilliCelsius}mC " +
+                    "quiet=${plan.quietSeconds}s fastQuiet=${plan.fastQuietSeconds}s " +
+                    "rebootEachRound=${plan.rebootEachRound}",
+            )
+            appendLine("holdRound: ${summary.holdRound ?: "-"} aborted: ${summary.aborted} reason: ${summary.abortReason ?: "-"}")
+            appendLine()
+            appendLine("round | result | payload | gate | start | peak | took | quiet | stray | spray")
+            for (record in summary.records) {
+                val spray = record.spray?.let { "${it.timers}/${it.timerGoal} errno=${it.createErrno}" } ?: "-"
+                appendLine(
+                    "${record.round} | ${record.result} | ${record.payload} | ${record.coolGate} | " +
+                        "${record.startMilliCelsius ?: -1} | ${record.peakMilliCelsius ?: -1} | " +
+                        "${record.durationMillis}ms | ${record.quietSeconds}s | ${record.strayLeft} | $spray",
+                )
+                appendLine("   trace: ${record.temperatureTrace.joinToString(" -> ")}")
+            }
+        }
+        val summaryWritten = writeSidecar("payload-run.txt", text.toByteArray(StandardCharsets.UTF_8))
+        var roundsWritten = 0
+        for (record in summary.records) {
+            if (record.logTail.isBlank()) continue
+            if (writeSidecar("round-${record.round}.log", record.logTail.toByteArray(StandardCharsets.UTF_8))) {
+                roundsWritten++
+            }
+        }
+        log(
+            "<k> payload diagnostics written: summary=$summaryWritten " +
+                "rounds=$roundsWritten/${summary.records.size}",
+        )
     }
 
     /* --- attack step status ------------------------------------------------
