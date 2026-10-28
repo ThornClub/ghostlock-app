@@ -9,27 +9,49 @@ package com.ghostlock.app.data.payload
  * lives in a self-contained payload that performs its own race, controlled
  * write and credential patch.
  *
- * GhostLock owns only the decisions around it: which payload a round uses, when
- * a round stops, and how a payload line maps to an outcome. The payload owns
- * the kernel primitive; GhostLock must never claim a write it did not verify.
+ * GhostLock owns only the decisions around it: which payload an invocation
+ * uses, whether the run can possibly succeed on this process, when the round
+ * stops, and how a payload line maps to an outcome. The payload owns the
+ * kernel primitive; GhostLock must never claim a write it did not verify.
+ *
+ * One invocation is one payload process on the current boot. The validated
+ * recipe (device gate 2026-10-22, Find N5 `gc4127a25dcf3`) started every
+ * attempt on a freshly booted kernel: round 1 missed, round 2 panicked the
+ * kernel, round 3 held a root child. A miss leaves the sprayed slab state
+ * dirty, so the caller re-invokes after the reboot instead of looping here.
  */
 object PayloadBridge {
     /** Kernel release fragment of the only build this bridge is validated for. */
     const val FindN5KernelMarker = "gc4127a25dcf3"
 
-    /** Odd rounds: timer fan-out variant. */
+    /** Timer fan-out variant; the one that reached a hold on the device gate. */
     const val FanoutPayload = "libn5fanout.so"
 
-    /** Even rounds: timer slot rotation variant. */
+    /** Timer slot rotation variant. */
     const val RotatePayload = "libn5rotate.so"
 
     /** Payload reached an interactive root child; this is the only success marker. */
     const val HoldMarker = "ROOT_CHILD_HOLD_PASS"
 
-    /** Payload refused this device; another round cannot change that. */
+    /** Payload refused this device; another invocation cannot change that. */
     const val RejectMarker = "TARGET_PROFILE_GATE_FAIL"
 
-    /** How one payload round ended. */
+    /** Payload self-check passed without touching the kernel. */
+    const val PreflightMarker = "PREFLIGHT_PASS"
+
+    /**
+     * Timer count the validated payload build bakes in.
+     *
+     * `timer_create()` charges `sigqueue_alloc()` against `RLIMIT_SIGPENDING`
+     * per uid, so this number must fit under the shell uid's `Max pending
+     * signals` ceiling. A build asking for more than the ceiling fills the
+     * spray only partially, reclaim never lines up, and every attempt ends in
+     * `BOOTID_WRITE_MISS`. The 55478 build was unrunnable for exactly this
+     * reason; the 40000 build fits under the 41381 ceiling.
+     */
+    const val TimerGoal = 40000
+
+    /** How one payload invocation ended. */
     enum class Outcome {
         /** Root child is live. */
         Hold,
@@ -44,16 +66,14 @@ object PayloadBridge {
         Stalled,
     }
 
-    /** One run: round count, per-round budget, silence limit and heat gates. */
+    /** One invocation: per-round budget, silence limit and heat gates. */
     data class Plan(
-        val rounds: Int = 25,
-        val budgetSeconds: Int = 640,
-        val stallSeconds: Int = 120,
-        val gateMilliCelsius: Int = 51300,
-        val panicMilliCelsius: Int = 60000,
+        val budgetSeconds: Int = 900,
+        val stallSeconds: Int = 20,
+        val gateMilliCelsius: Int = 58000,
+        val panicMilliCelsius: Int = 75000,
     ) {
         init {
-            require(rounds > 0) { "rounds must be positive" }
             require(budgetSeconds > 0) { "budgetSeconds must be positive" }
             require(stallSeconds > 0) { "stallSeconds must be positive" }
             require(gateMilliCelsius > 0) { "gateMilliCelsius must be positive" }
@@ -67,14 +87,10 @@ object PayloadBridge {
     fun isFindN5Kernel(release: String): Boolean = release.contains(FindN5KernelMarker)
 
     /**
-     * Payload for a 1-based round. Alternating the two variants is what gives a
-     * round a second chance after a miss; the choice is round parity, never
-     * kernel metadata.
+     * Payload for one invocation. The choice is explicit and comes from the
+     * caller; it is never inferred from kernel metadata.
      */
-    fun payloadForRound(round: Int): String {
-        require(round > 0) { "rounds are 1-based" }
-        return if (round % 2 == 0) RotatePayload else FanoutPayload
-    }
+    fun payloadFor(rotate: Boolean): String = if (rotate) RotatePayload else FanoutPayload
 
     /** Terminal outcome carried by [line], or null for a plain progress line. */
     fun classify(line: String): Outcome? = when {
@@ -86,4 +102,27 @@ object PayloadBridge {
     /** True when the round must stop immediately instead of burning its budget. */
     fun isTerminal(outcome: Outcome?): Boolean =
         outcome == Outcome.Hold || outcome == Outcome.Rejected
+
+    /**
+     * Soft `Max pending signals` limit from `/proc/self/limits`, or 0 when the
+     * line is missing. The payload child inherits these limits from this
+     * process, which is why the check reads them here and not inside the
+     * payload.
+     */
+    fun maxPendingSignals(limits: String): Int {
+        val line = limits.lineSequence()
+            .firstOrNull { it.trimStart().startsWith("Max pending signals") }
+            ?: return 0
+        return line.trim().split(Regex("\\s+"))
+            .firstOrNull { token -> token.isNotEmpty() && token.all(Char::isDigit) }
+            ?.toIntOrNull()
+            ?: 0
+    }
+
+    /**
+     * True when the spray can reach [TimerGoal] on this process. Unreadable
+     * limits fail the gate: a run that cannot fill the spray burns the boot for
+     * nothing, and the caller has no way to tell that from a genuine miss.
+     */
+    fun timerBudgetFits(limits: String): Boolean = maxPendingSignals(limits) >= TimerGoal
 }

