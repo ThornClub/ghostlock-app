@@ -27,7 +27,6 @@ import com.ghostlock.app.data.payload.PayloadRoundDriver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.runInterruptible
@@ -549,8 +548,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
         override fun isOnline(): Boolean = shizukuRunner.isBinderAlive()
 
-        override fun killStrayPayloads(): Int =
-            runBlocking { shizukuRunner.killStrayPayloads(log) } ?: -1
+        override fun killStrayPayloads(): Int {
+            val left = runBlocking { shizukuRunner.killStrayPayloads(log) }
+            if (left == null) log("<s> cannot sweep stray payloads: UserService unreachable")
+            return left ?: 0
+        }
 
         override fun runRound(
             rotate: Boolean,
@@ -565,7 +567,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val tail = ArrayDeque<String>()
 
             val job = launch {
-                exitCode = shizukuRunner.runPayload(rotate, plan, onLog = { line ->
+                /* 单轮抛异常 (例如 Shizuku 半路掉线) 不应掀翻整条 run: 记下来当作本轮失败。 */
+                exitCode = runCatching {
+                    shizukuRunner.runPayload(rotate, plan, onLog = { line ->
                     synchronized(tail) {
                         tail.addLast(line)
                         while (tail.size > RoundTailLines) tail.removeFirst()
@@ -577,7 +581,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         PayloadBridge.Outcome.Rejected -> sawReject = true
                         else -> Unit
                     }
-                })
+                    })
+                }.getOrElse { error ->
+                    log("<s> payload round failed: ${error.message}")
+                    -1
+                }
             }
 
             while (job.isActive) {
