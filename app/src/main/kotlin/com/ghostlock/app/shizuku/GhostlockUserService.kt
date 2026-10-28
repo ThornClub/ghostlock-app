@@ -18,10 +18,20 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
     @Volatile
     private var payloadProcess: java.lang.Process? = null
 
+    /** 本轮载荷的日志文件 (stdout 重定向到这里), handover 从它解析各步返回码。 */
+    @Volatile
+    private var payloadLog: File? = null
+
     private companion object {
         const val StatusMarker = "\u001eGLK_STATUS"
         const val StatusAck = "\u001eGLK_STATUS_ACK\n"
         const val StatusDisabled = "\u001eGLK_STATUS_DISABLED"
+        /** 载荷进程名 (comm), 残留清理只认这两个。 */
+        val PayloadNames = setOf("n5fanout", "n5rotate")
+
+        /** handover 脚本打完这一步就认为"命令都发完了", 成败另由 /proc/modules 判定。 */
+        const val KsuHandoverDone = "KSU_HANDOVER_DONE_MARK"
+        const val KsuHandoverTimeoutMs = 120_000L
     }
 
     override fun runExploit(
@@ -230,6 +240,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                     .redirectOutput(log)
                     .start()
                 payloadProcess = process
+                payloadLog = log
                 val outcome =
                     awaitPayloadOutcome(process, log, budgetSeconds, stallSeconds, callback)
                 when (outcome) {
@@ -267,14 +278,14 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
      *  300s. The validated recipe fires at 58C; hotter starts were aborted by
      *  thermal handling, and no round gained anything from waiting longer. */
     private fun waitForThermalGate(gateMilliCelsius: Int, callback: IGhostlockCallback) {
-        if (maxThermalMilliCelsius() <= gateMilliCelsius) return
-        callback.onLog("<p> temp=${maxThermalMilliCelsius()}mC gate=${gateMilliCelsius}mC, cooling")
+        if (readMaxThermalMilliCelsius() <= gateMilliCelsius) return
+        callback.onLog("<p> temp=${readMaxThermalMilliCelsius()}mC gate=${gateMilliCelsius}mC, cooling")
         var waited = 0
-        while (waited < 300 && maxThermalMilliCelsius() > gateMilliCelsius) {
+        while (waited < 300 && readMaxThermalMilliCelsius() > gateMilliCelsius) {
             Thread.sleep(2000)
             waited += 2
         }
-        callback.onLog("<p> temp=${maxThermalMilliCelsius()}mC after ${waited}s")
+        callback.onLog("<p> temp=${readMaxThermalMilliCelsius()}mC after ${waited}s")
     }
 
     /** Runs the payload's own read-only self-check. `--preflight` reports the
@@ -352,7 +363,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
     }
 
     /** Hottest CPU/SoC thermal zone in milli-Celsius, or 0 when unreadable. */
-    private fun maxThermalMilliCelsius(): Int {
+    private fun readMaxThermalMilliCelsius(): Int {
         var best = 0
         val root = File("/sys/class/thermal")
         val zones = root.listFiles() ?: return 0
@@ -467,6 +478,179 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 }
             }
         }
+    }
+
+    /* ---- 载荷编排原语 (design D2) -------------------------------------------
+     * 这几件事在 app 进程里都做不到: 温度 zone、reboot、/proc/modules 与杀残留载荷
+     * 都要求 uid=shell。app 侧只做决策, 这里只提供可观察的结果。 */
+
+    override fun maxThermalMilliCelsius(): Int = readMaxThermalMilliCelsius()
+
+    /**
+     * 清杀残留载荷。上一轮 MISS/HOTABORT 之后进程可能还挂着, 它会继续占用 timer
+     * 配额, 导致下一轮的喷堆填不满。只动本进程 uid 的载荷, 返回清理后仍在的数量。
+     */
+    override fun killStrayPayloads(): Int {
+        payloadProcess?.let { process -> if (process.isAlive) process.destroy() }
+        val mine = Process.myUid()
+        val names = PayloadNames
+        for (entry in File("/proc").listFiles().orEmpty()) {
+            val pid = entry.name.toIntOrNull() ?: continue
+            if (pid == Process.myPid()) continue
+            val comm = readProcCommand(entry) ?: continue
+            if (comm !in names) continue
+            val owner = readProcUid(entry)
+            if (owner != null && owner != mine) continue
+            Process.killProcess(pid)
+        }
+        return countStrayPayloads(mine)
+    }
+
+    /**
+     * 发出 reboot 命令并返回它的退出码。这里不判断成功: shell 域没有 CAP_SYS_BOOT,
+     * 能否真正重启由调用方用 boot_id 变化确认, 命令失败就如实返回非 0。
+     */
+    override fun rebootDevice(): Int = runCatching {
+        val process = ProcessBuilder("reboot").redirectErrorStream(true).start()
+        if (!process.waitFor(10, TimeUnit.SECONDS)) {
+            process.destroy()
+            return@runCatching -1
+        }
+        process.exitValue()
+    }.getOrDefault(-1)
+
+    /**
+     * KernelSU handover (design D6)。root child 就在当前载荷进程里, 所以脚本走它的
+     * stdin, 结果从载荷日志里的标记读回。返回 0 仅当 /proc/modules 里 kernelsu 处于
+     * Live; insmod 成功但 install 失败会返回 1, 与真机 diag 的失败形态一致。
+     */
+    override fun handoverKernelSU(managerPackage: String?, callback: IGhostlockCallback) {
+        val process = payloadProcess
+        val log = payloadLog
+        if (process == null || !process.isAlive || log == null) {
+            runCatching { callback.onLog("<s> ksu: no live root child; nothing to hand over") }
+            runCatching { callback.onComplete(1) }
+            return
+        }
+        val code = runCatching { runKernelSuHandover(process, log, managerPackage, callback) }
+            .getOrElse { error ->
+                runCatching { callback.onLog("<s> ksu error: ${error.message}") }
+                1
+            }
+        runCatching { callback.onComplete(code) }
+    }
+
+    private fun runKernelSuHandover(
+        process: java.lang.Process,
+        log: File,
+        managerPackage: String?,
+        callback: IGhostlockCallback,
+    ): Int {
+        val ksud = resolveKernelSuTool(managerPackage, "libksud.so", "ksud")
+        val lib = resolveKernelSuTool(managerPackage, "libadbroot.so", "libadbroot.so")
+        val ko = listOf(File(context.filesDir, "kernelsu.ko"), File("/data/local/tmp/kernelsu.ko"))
+            .firstOrNull { it.isFile }
+        callback.onLog(
+            "<p> ksu tools: ksud=${ksud?.absolutePath ?: "missing"} " +
+                "libadbroot=${lib?.absolutePath ?: "missing"} ko=${ko?.absolutePath ?: "missing"}",
+        )
+
+        val script = buildString {
+            appendLine("echo __KSU_BEGIN__")
+            /* permissive 必须保持到 install 结束: shell 域一旦回到 enforcing, /data/adb 就不可写。 */
+            appendLine("setenforce 0 2>/dev/null; echo KSU_ENFORCE=$(getenforce)")
+            if (ksud != null && ko != null && lib != null) {
+                appendLine("chmod 755 ${ksud.absolutePath} ${lib.absolutePath} ${ko.absolutePath}")
+                appendLine("${ksud.absolutePath} insmod ${ko.absolutePath}; echo KSU_INSMOD_RC=$?")
+                appendLine(
+                    "if [ $? -ne 0 ]; then uname -r; dmesg 2>/dev/null | tail -n 60 | " +
+                        "grep -iE 'kernelsu|vermagic|unknown symbol|disagrees|invalid module' | tail -n 20; fi",
+                )
+                appendLine("sleep 2; grep kernelsu /proc/modules; echo KSU_MODPROBE_DONE")
+                appendLine(
+                    "${ksud.absolutePath} install --libadbroot ${lib.absolutePath} " +
+                        "--data-path /data/adb; echo KSU_INSTALL_RC=$?",
+                )
+                appendLine("sleep 2; ls -l /system/bin/su 2>&1; ls -l /data/adb/ksud 2>&1")
+                appendLine(
+                    "if [ -x /data/adb/ksud ]; then /data/adb/ksud soft-reboot; " +
+                        "else ${ksud.absolutePath} soft-reboot; fi; echo KSU_SOFTREBOOT_RC=$?",
+                )
+            } else {
+                appendLine("echo KSU_TOOLS_MISSING")
+            }
+            appendLine("echo $KsuHandoverDone")
+            append("exit\n")
+        }
+
+        val stdin = process.outputStream
+        stdin.write(script.toByteArray(Charsets.UTF_8))
+        stdin.flush()
+
+        var offset = 0L
+        val deadline = System.currentTimeMillis() + KsuHandoverTimeoutMs
+        val seen = StringBuilder()
+        while (System.currentTimeMillis() < deadline) {
+            val text = runCatching { log.readText() }.getOrNull()
+            if (text != null && text.length > offset) {
+                val chunk = text.substring(offset.toInt())
+                offset = text.length.toLong()
+                seen.append(chunk)
+                chunk.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+                    runCatching { callback.onLog(line) }
+                }
+                if (chunk.contains(KsuHandoverDone)) break
+            }
+            if (!process.isAlive) break
+            Thread.sleep(500)
+        }
+
+        val live = runCatching { File("/proc/modules").readText() }.getOrNull()
+            ?.lineSequence()
+            ?.any { line -> line.startsWith("kernelsu ") && line.contains("Live") }
+            ?: false
+        callback.onLog("<p> ksu module live=$live")
+        callback.onLog("<p> ksu step rc: ${seen.lineSequence().filter { it.startsWith("KSU_") }.joinToString(" ")}")
+        return if (live) 0 else 1
+    }
+
+    /** ksud / libadbroot 从管理器应用里取, 取不到再看 filesDir 里的拷贝。 */
+    private fun resolveKernelSuTool(managerPackage: String?, libName: String, localName: String): File? {
+        val pm = context.packageManager
+        val packages = buildList {
+            managerPackage?.let { add(it) }
+            addAll(ManagerScanner.resolvePackages(managerPackage))
+        }
+        for (pkg in packages) {
+            val fromManager = runCatching {
+                File(pm.getApplicationInfo(pkg, 0).nativeLibraryDir, libName)
+            }.getOrNull()
+            if (fromManager != null && fromManager.isFile) return fromManager
+        }
+        return File(context.filesDir, localName).takeIf { it.isFile }
+    }
+
+    private fun readProcCommand(entry: File): String? {
+        val raw = runCatching { File(entry, "cmdline").readBytes() }.getOrNull() ?: return null
+        val text = String(raw, Charsets.UTF_8).trim('\u0000', ' ')
+        if (text.isEmpty()) return null
+        return text.substringBefore(' ').substringAfterLast('/')
+    }
+
+    private fun readProcUid(entry: File): Int? = runCatching {
+        File(entry, "status").readLines()
+            .firstOrNull { it.startsWith("Uid:") }
+            ?.split(' ', '\t')
+            ?.filter { it.isNotEmpty() }
+            ?.getOrNull(1)
+            ?.toInt()
+    }.getOrNull()
+
+    private fun countStrayPayloads(mine: Int): Int = File("/proc").listFiles().orEmpty().count { entry ->
+        val pid = entry.name.toIntOrNull() ?: return@count false
+        if (pid == Process.myPid()) return@count false
+        val comm = readProcCommand(entry) ?: return@count false
+        comm in PayloadNames && (readProcUid(entry)?.let { it == mine } ?: true)
     }
 
     override fun destroy() {
