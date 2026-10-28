@@ -1,0 +1,88 @@
+name: Gate APK
+
+# 真机门禁用: 打一个可直接下载的 APK 并挂到预发布版本上。
+# CI artifact 需要 token 才能下载, 而门禁机器没有 Android SDK, 所以走 release 资产 (公开可下)。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - n5-gate-apk
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gate-apk
+  cancel-in-progress: true
+
+jobs:
+  publish-apk:
+    name: Publish gate APK
+    runs-on: ubuntu-latest
+    env:
+      ONDK_VERSION: "r30.1"
+      GATE_TAG: n5-payload-gate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          java-version: 21
+          distribution: zulu
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Cache ONDK
+        id: ondk-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/ondk
+          key: ondk-${{ env.ONDK_VERSION }}-linux
+
+      - name: Download ONDK
+        if: steps.ondk-cache.outputs.cache-hit != 'true'
+        run: |
+          url="https://github.com/topjohnwu/ondk/releases/download/${ONDK_VERSION}/ondk-${ONDK_VERSION}-linux.tar.xz"
+          mkdir -p "${{ runner.temp }}/ondk"
+          curl -fL "$url" -o "${{ runner.temp }}/ondk.tar.xz"
+          tar -C "${{ runner.temp }}/ondk" --strip-components=1 -xf "${{ runner.temp }}/ondk.tar.xz"
+
+      - name: Link ONDK Rust toolchain
+        run: rustup toolchain link ondk "${{ runner.temp }}/ondk/toolchains/rust"
+
+      - name: Assemble debug APK
+        run: |
+          export ONDK_HOME="${{ runner.temp }}/ondk"
+          export ANDROID_NDK_HOME="$ONDK_HOME"
+          export NDK_ROOT="$ONDK_HOME"
+          export CC_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          export AR_aarch64_linux_android="$ONDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Name the asset
+        run: |
+          sha="$(git rev-parse --short HEAD)"
+          cp build/app/outputs/apk/debug/app-debug.apk "GhostLock-debug-${sha}.apk"
+          ls -l GhostLock-debug-*.apk
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: n5-payload-gate
+          name: N5 payload gate build
+          prerelease: true
+          body: |
+            真机门禁用构建 (自动发布, 每次覆盖)。
+            commit: ${{ github.sha }}
+            分支: ${{ github.ref_name }}
+          files: GhostLock-debug-*.apk
+          fail_on_unmatched_files: true
