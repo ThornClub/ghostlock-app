@@ -318,7 +318,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
 
     /** Consumes the payload log until a terminal marker, an exit or a stall. */
     private fun awaitPayloadOutcome(
-        process: Process,
+        process: java.lang.Process,
         log: File,
         budgetSeconds: Int,
         stallSeconds: Int,
