@@ -70,8 +70,8 @@ jobs:
 
       - name: Name the asset
         run: |
-          set -euo pipefail
-          apk="$(find . -path ./build/app/intermediates -prune -o -name 'app-debug.apk' -print | head -1)"
+          # 注意: 不要用 `find ... | head`, pipefail 下 head 关闭管道会让 find 以 141 退出。
+          apk="$(find . -name 'app-debug.apk' -print -quit)"
           if [ -z "$apk" ]; then
             echo "app-debug.apk not found; apk outputs:"
             find . -name '*.apk' -print | head -20
