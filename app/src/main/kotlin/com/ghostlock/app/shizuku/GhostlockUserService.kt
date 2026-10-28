@@ -551,21 +551,31 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         val lib = resolveKernelSuTool(managerPackage, "libadbroot.so", "libadbroot.so")
         val ko = listOf(File(context.filesDir, "kernelsu.ko"), File("/data/local/tmp/kernelsu.ko"))
             .firstOrNull { it.isFile }
+        /* 模块走 ksud late-load (与 native handoff 同一条路径), 因此不依赖随包的 kernelsu.ko;
+         * 只有现场恰好有 ko 文件时才退回 insmod。KMI 由 uname release 推出。 */
+        val release = System.getProperty("os.version", "").orEmpty()
+        val kmi = PayloadBridge.kmiFor(release)
         callback.onLog(
             "<p> ksu tools: ksud=${ksud?.absolutePath ?: "missing"} " +
-                "libadbroot=${lib?.absolutePath ?: "missing"} ko=${ko?.absolutePath ?: "missing"}",
+                "libadbroot=${lib?.absolutePath ?: "missing"} ko=${ko?.absolutePath ?: "-"} " +
+                "kmi=${kmi ?: "unknown"}",
         )
 
         val script = buildString {
             appendLine("echo __KSU_BEGIN__")
             /* permissive 必须保持到 install 结束: shell 域一旦回到 enforcing, /data/adb 就不可写。 */
             appendLine("setenforce 0 2>/dev/null; echo KSU_ENFORCE=$(getenforce)")
-            if (ksud != null && ko != null && lib != null) {
-                appendLine("chmod 755 ${ksud.absolutePath} ${lib.absolutePath} ${ko.absolutePath}")
-                appendLine("${ksud.absolutePath} insmod ${ko.absolutePath}; echo KSU_INSMOD_RC=$?")
+            if (ksud != null && lib != null && kmi != null) {
+                appendLine("chmod 755 ${ksud.absolutePath} ${lib.absolutePath}")
+                if (ko != null) {
+                    appendLine("chmod 755 ${ko.absolutePath}")
+                    appendLine("${ksud.absolutePath} insmod ${ko.absolutePath}; echo KSU_INSMOD_RC=$?")
+                } else {
+                    appendLine("${ksud.absolutePath} late-load --kmi $kmi --allow-shell; echo KSU_LATELOAD_RC=$?")
+                }
                 appendLine(
-                    "if [ $? -ne 0 ]; then uname -r; dmesg 2>/dev/null | tail -n 60 | " +
-                        "grep -iE 'kernelsu|vermagic|unknown symbol|disagrees|invalid module' | tail -n 20; fi",
+                    "dmesg 2>/dev/null | tail -n 60 | " +
+                        "grep -iE 'kernelsu|vermagic|unknown symbol|disagrees|invalid module' | tail -n 20",
                 )
                 appendLine("sleep 2; grep kernelsu /proc/modules; echo KSU_MODPROBE_DONE")
                 appendLine(

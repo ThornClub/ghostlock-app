@@ -120,6 +120,23 @@ object PayloadBridge {
     /** True when [release] is the build this bridge was validated on. */
     fun isFindN5Kernel(release: String): Boolean = release.contains(FindN5KernelMarker)
 
+
+    /**
+     * KernelSU KMI for [release] (`android15-6.6` for `6.6.118-android15-8-...`).
+     *
+     * `ksud late-load --kmi` is how the native handoff already loads the module, so the payload
+     * path reuses it instead of shipping a `kernelsu.ko`. Null when the release does not carry
+     * both an `androidNN` tag and a `major.minor` prefix.
+     */
+    fun kmiFor(release: String): String? {
+        val android = AndroidTagPattern.find(release)?.groupValues?.getOrNull(1) ?: return null
+        val version = release.split('-').firstOrNull { KernelVersionPattern.matches(it) } ?: return null
+        val majorMinor = version.split('.').take(2).joinToString(".")
+        return "android$android-$majorMinor"
+    }
+
+    private val AndroidTagPattern = Regex("android(\\d+)")
+    private val KernelVersionPattern = Regex("\\d+\\.\\d+.*")
     /**
      * Payload for one invocation. The choice is explicit and comes from the
      * caller; it is never inferred from kernel metadata.

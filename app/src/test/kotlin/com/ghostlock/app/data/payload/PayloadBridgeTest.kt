@@ -104,4 +104,22 @@ class PayloadBridgeTest {
         // older 55478 build could never fill it and only produced misses.
         assertEquals(40000, PayloadBridge.TimerGoal)
     }
+
+    @Test
+    fun `kmi is derived from the uname release`() {
+        assertEquals(
+            "android15-6.6",
+            PayloadBridge.kmiFor("6.6.118-android15-8-gc4127a25dcf3-ab15863337-4k"),
+        )
+        assertEquals(
+            "android14-6.1",
+            PayloadBridge.kmiFor("6.1.138-android14-11-g0c3d559bcd85-ab14529422"),
+        )
+    }
+
+    @Test
+    fun `kmi is null when the release has no android tag`() {
+        assertNull(PayloadBridge.kmiFor("6.6.118-generic"))
+        assertNull(PayloadBridge.kmiFor(""))
+    }
 }
