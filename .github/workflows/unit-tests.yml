@@ -2,6 +2,8 @@ name: Unit tests
 
 on:
   push:
+    branches-ignore:
+      - ci-report
     paths-ignore:
       - "**.md"
   pull_request:
@@ -10,6 +12,9 @@ on:
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   unit-tests:
@@ -33,7 +38,9 @@ jobs:
       # preBuild deliberately does not depend on the native tasks
       # (app/build.gradle.kts), so JVM unit tests need neither the NDK nor cargo.
       - name: Run unit tests
-        run: ./gradlew :app:testDebugUnitTest --no-daemon
+        run: |
+          set -o pipefail
+          ./gradlew :app:testDebugUnitTest --no-daemon 2>&1 | tee "$RUNNER_TEMP/unit-tests.log"
 
       - name: Upload test report
         if: always()
@@ -42,3 +49,28 @@ jobs:
           name: unit-test-report
           path: app/build/reports/tests
           if-no-files-found: ignore
+
+      # 包装器日志默认要 token 才能读; 把失败摘要推到 ci-report 分支, 任何人有仓读权限就能看。
+      - name: Publish failure report
+        if: failure()
+        run: |
+          {
+            echo "# unit-tests failure"
+            echo
+            echo "sha: $GITHUB_SHA"
+            echo
+            echo '```'
+            grep -nE "^e: |error:|FAILURE:|What went wrong|Caused by|SDK|Could not resolve|Could not find" \
+              "$RUNNER_TEMP/unit-tests.log" | head -40 || true
+            echo '```'
+            echo
+            echo '```'
+            tail -n 100 "$RUNNER_TEMP/unit-tests.log"
+            echo '```'
+          } > ci-report.md
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -q -b ci-report
+          git add -f ci-report.md
+          git commit -q -m "ci: unit-test failure report for ${GITHUB_SHA::7}"
+          git push --force origin ci-report
