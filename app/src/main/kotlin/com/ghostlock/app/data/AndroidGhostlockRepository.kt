@@ -570,17 +570,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 /* 单轮抛异常 (例如 Shizuku 半路掉线) 不应掀翻整条 run: 记下来当作本轮失败。 */
                 exitCode = runCatching {
                     shizukuRunner.runPayload(rotate, plan, onLog = { line ->
-                    synchronized(tail) {
-                        tail.addLast(line)
-                        while (tail.size > RoundTailLines) tail.removeFirst()
-                        onLogTail(tail.joinToString("\n"))
-                    }
-                    log(line)
-                    when (PayloadBridge.classify(line)) {
-                        PayloadBridge.Outcome.Hold -> sawHold = true
-                        PayloadBridge.Outcome.Rejected -> sawReject = true
-                        else -> Unit
-                    }
+                        synchronized(tail) {
+                            tail.addLast(line)
+                            while (tail.size > RoundTailLines) tail.removeFirst()
+                            onLogTail(tail.joinToString("\n"))
+                        }
+                        log(line)
+                        when (PayloadBridge.classify(line)) {
+                            PayloadBridge.Outcome.Hold -> sawHold = true
+                            PayloadBridge.Outcome.Rejected -> sawReject = true
+                            else -> Unit
+                        }
                     })
                 }.getOrElse { error ->
                     log("<s> payload round failed: ${error.message}")
