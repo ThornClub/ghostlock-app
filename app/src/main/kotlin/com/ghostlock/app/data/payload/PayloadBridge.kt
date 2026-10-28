@@ -66,12 +66,33 @@ object PayloadBridge {
         Stalled,
     }
 
-    /** One invocation: per-round budget, silence limit and heat gates. */
+    /**
+     * 一轮的预算与热度门槛, 加上 host 侧的调度参数。
+     *
+     * 调度参数 (rounds / coolTimeout / fastAfterCrash ...) 只被 app 的轮次驱动读取, native
+     * 与 UserService 都看不到; 每轮真正下传给 UserService 的只有 [budgetSeconds] /
+     * [stallSeconds] / [gateMilliCelsius]。
+     */
     data class Plan(
         val budgetSeconds: Int = 900,
         val stallSeconds: Int = 20,
         val gateMilliCelsius: Int = 58000,
         val panicMilliCelsius: Int = 75000,
+        val rounds: Int = 25,
+        val coolTimeoutSeconds: Int = 300,
+        val quietSeconds: Int = 20,
+        val fastQuietSeconds: Int = 5,
+        val fastAfterCrash: Int = 8,
+        val rebootEachRound: Boolean = true,
+        val pollSeconds: Int = 5,
+        /* 平台期放行: 90 s 窗口内降幅不足 2 C 且当前不超过门限 + 2 C 时也放行。热平衡点常常
+         * 停在门限上方, 死等只会把每轮的 coolTimeout 烧光。 */
+        val plateauWindowSeconds: Int = 90,
+        val plateauDeltaMilliCelsius: Int = 2000,
+        val plateauMarginMilliCelsius: Int = 2000,
+        /* 连续崩溃后的重置温度: 连续崩说明喷堆把 slab 弄脏了, 只靠换 boot 不够。 */
+        val rebootCoolMilliCelsius: Int = 78000,
+        val crashStreakForFullReset: Int = 2,
     ) {
         init {
             require(budgetSeconds > 0) { "budgetSeconds must be positive" }
@@ -80,6 +101,19 @@ object PayloadBridge {
             require(panicMilliCelsius > gateMilliCelsius) {
                 "panic gate must sit above the fire gate"
             }
+            require(rounds > 0) { "rounds must be positive" }
+            require(coolTimeoutSeconds > 0) { "coolTimeoutSeconds must be positive" }
+            require(fastAfterCrash >= 0) { "fastAfterCrash must not be negative" }
+            require(quietSeconds >= 0 && fastQuietSeconds >= 0) {
+                "quiet seconds must not be negative"
+            }
+            require(pollSeconds > 0) { "pollSeconds must be positive" }
+            require(plateauWindowSeconds > 0) { "plateauWindowSeconds must be positive" }
+            require(plateauDeltaMilliCelsius > 0 && plateauMarginMilliCelsius > 0) {
+                "plateau thresholds must be positive"
+            }
+            require(rebootCoolMilliCelsius > 0) { "rebootCoolMilliCelsius must be positive" }
+            require(crashStreakForFullReset > 0) { "crashStreakForFullReset must be positive" }
         }
     }
 
