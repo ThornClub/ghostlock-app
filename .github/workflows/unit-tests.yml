@@ -71,7 +71,9 @@ jobs:
             echo "## JUnit failure details"
             echo
             echo '```'
-            grep -h -A8 "<failure" app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null | head -80 || true
+            find app/build -path '*test-results*' -name '*.xml' -print 2>/dev/null | head -5
+            echo '---'
+            find app/build -path '*test-results*' -name '*.xml' -exec grep -h -A6 '<failure' {} + 2>/dev/null | head -100 || true
             echo '```'
           } > ci-report.md
           git config user.name "github-actions"

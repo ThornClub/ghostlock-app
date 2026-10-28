@@ -6,7 +6,6 @@ import com.ghostlock.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -60,12 +59,17 @@ class ExporterAgreementTest {
                     .also { it.edit().clear().commit() },
             )
             for (release in expected) {
-                val appBytes = controller.nativeDocument(controller.load(release, pair))
-                assertNotNull("$release: app has no native document", appBytes)
+                val appBytes = requireNotNull(controller.nativeDocument(controller.load(release, pair))) {
+                    "$release: app has no native document"
+                }
+                val exporterBytes = File(exporterDir, "$release.bin").readBytes()
+                /* 失败时要能直接看出差在哪个字节, 而不是只拿到两份数组。 */
+                val firstDiff = appBytes.indices.firstOrNull { appBytes[it] != exporterBytes.getOrNull(it) }
                 assertArrayEquals(
-                    "$release: exporter differs from the app",
+                    "$release: exporter differs from the app " +
+                        "(len app=${appBytes.size} exporter=${exporterBytes.size}, firstDiff=$firstDiff)",
                     appBytes,
-                    File(exporterDir, "$release.bin").readBytes(),
+                    exporterBytes,
                 )
             }
         } finally {
