@@ -67,6 +67,12 @@ jobs:
             echo '```'
             tail -n 100 "$RUNNER_TEMP/unit-tests.log"
             echo '```'
+            echo
+            echo "## JUnit failure details"
+            echo
+            echo '```'
+            grep -h -A8 "<failure" app/build/test-results/testDebugUnitTest/*.xml 2>/dev/null | head -80 || true
+            echo '```'
           } > ci-report.md
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
